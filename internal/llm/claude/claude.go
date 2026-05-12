@@ -335,10 +335,15 @@ func (p *Provider) Ask(ctx context.Context, req llm.AskRequest) (<-chan llm.Toke
 	}
 
 	var msgs []message
-	// Inject focus context as the first user turn so it's stable across the conversation.
-	focus := buildAskFocus(req)
-	msgs = append(msgs, message{Role: "user", Content: []contentBlock{{Type: "text", Text: focus}}})
-	msgs = append(msgs, message{Role: "assistant", Content: []contentBlock{{Type: "text", Text: "Ready."}}})
+	// Node-scoped Q&A: inject focus context as a stable first user turn so the
+	// model can refer to it across follow-ups. Session-scoped Q&A leaves
+	// Source empty because each turn carries its own focus tag + source inside
+	// req.Question — see internal/tui askCmd.
+	if req.Source != "" {
+		focus := buildAskFocus(req)
+		msgs = append(msgs, message{Role: "user", Content: []contentBlock{{Type: "text", Text: focus}}})
+		msgs = append(msgs, message{Role: "assistant", Content: []contentBlock{{Type: "text", Text: "Ready."}}})
+	}
 	for _, t := range req.History {
 		msgs = append(msgs, message{Role: t.Role, Content: []contentBlock{{Type: "text", Text: t.Content}}})
 	}

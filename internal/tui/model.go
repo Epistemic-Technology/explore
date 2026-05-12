@@ -34,14 +34,27 @@ const paneCount = 3
 
 // Tabs within the explanation pane.
 const (
-	expTabPlain = 0
-	expTabQA    = 1
+	expTabPlain     = 0
+	expTabNodeQA    = 1
+	expTabSessionQA = 2
 )
 
 var paneTabs = map[int][]string{
 	paneTree: {"Tree"},
-	paneExp:  {"Explanation", "Q&A"},
+	paneExp:  {"Explanation", "Q&A (node)", "Q&A (session)"},
 	paneSrc:  {"Source"},
+}
+
+// qaTabMode maps an explanation-pane tab to its Q&A mode string, or returns
+// "" if the tab is not a Q&A tab.
+func qaTabMode(tab int) string {
+	switch tab {
+	case expTabNodeQA:
+		return "node"
+	case expTabSessionQA:
+		return "session"
+	}
+	return ""
 }
 
 // Model is the root Bubble Tea model.
@@ -96,13 +109,50 @@ type Model struct {
 	statusMsg string
 }
 
+// qaState holds Q&A UI state. The active mode is derived from m.expTab
+// (expTabNodeQA / expTabSessionQA), not stored here:
+//   - node:    history is per focused node; context = source + parent summary,
+//              attached once as the leading turn (stable focus).
+//   - session: one running thread; each new question is wrapped with its own
+//              [focus: …] tag + source so the model can resolve "this" / "that"
+//              across nodes.
+//
+// stream* fields snapshot the mode/node at askCmd time so the assistant turn
+// lands in the right thread even if the user switches tabs or navigates
+// while tokens are streaming.
 type qaState struct {
-	input    string
-	thread   []llm.Turn
-	stream   string
-	streamCh <-chan llm.Token
-	cancel   context.CancelFunc
-	scope    string
+	input string
+
+	nodeThreads map[model.NodeID][]llm.Turn
+	sessionLog  []llm.Turn
+
+	stream     string
+	streamCh   <-chan llm.Token
+	cancel     context.CancelFunc
+	streamMode string
+	streamFor  model.NodeID
+}
+
+func (q *qaState) threadFor(mode string, id model.NodeID) []llm.Turn {
+	if mode == "session" {
+		return q.sessionLog
+	}
+	return q.nodeThreads[id]
+}
+
+// streamVisible reports whether the in-flight (or just-completed) stream
+// belongs to the thread currently on screen.
+func (q *qaState) streamVisible(mode string, id model.NodeID) bool {
+	if q.streamCh == nil && q.stream == "" {
+		return false
+	}
+	if q.streamMode != mode {
+		return false
+	}
+	if mode == "node" && q.streamFor != id {
+		return false
+	}
+	return true
 }
 
 func NewModel(gen *index.Generator, tree *Tree) Model {
@@ -114,7 +164,9 @@ func NewModel(gen *index.Generator, tree *Tree) Model {
 		expCache:    make(map[model.NodeID]*model.Explanation),
 		sourceCache: make(map[string]string),
 		parsedCache: make(map[string]*tsparse.ParsedFile),
-		qa:          qaState{scope: "node"},
+		qa: qaState{
+			nodeThreads: make(map[model.NodeID][]llm.Turn),
+		},
 	}
 	if rows := tree.Rows(); len(rows) > 0 {
 		m.cursor = 0
@@ -232,7 +284,10 @@ func (m *Model) scheduleLoad(id model.NodeID) tea.Cmd {
 		m.loadCancel = nil
 	}
 	m.loadGen++
-	if id.Kind != model.KindFile && id.Kind != model.KindSymbol {
+	switch id.Kind {
+	case model.KindFile, model.KindSymbol, model.KindDir, model.KindRepo:
+		// loadable
+	default:
 		m.loading = false
 		debug.Logf("scheduleLoad: skip kind=%v path=%q sym=%q (not loadable)", id.Kind, id.Path, id.Symbol)
 		return nil
@@ -268,6 +323,14 @@ func (m Model) loadCmd(ctx context.Context, id model.NodeID, loadGen int) tea.Cm
 		case model.KindSymbol:
 			exp, err := indexGen.ExplainSymbol(ctx, id.Path, id.Symbol, parentSummary)
 			debug.Logf("loadCmd: ExplainSymbol done path=%q sym=%q gen=%d err=%v proseLen=%d", id.Path, id.Symbol, loadGen, err, proseLen(exp))
+			return explanationMsg{id: id, gen: loadGen, exp: exp, err: err}
+		case model.KindDir:
+			exp, err := indexGen.ExplainDir(ctx, id.Path)
+			debug.Logf("loadCmd: ExplainDir done path=%q gen=%d err=%v proseLen=%d", id.Path, loadGen, err, proseLen(exp))
+			return explanationMsg{id: id, gen: loadGen, exp: exp, err: err}
+		case model.KindRepo:
+			exp, err := indexGen.ExplainRepo(ctx)
+			debug.Logf("loadCmd: ExplainRepo done gen=%d err=%v proseLen=%d", loadGen, err, proseLen(exp))
 			return explanationMsg{id: id, gen: loadGen, exp: exp, err: err}
 		}
 		return explanationMsg{id: id, gen: loadGen}
@@ -453,8 +516,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.done {
-			debug.Logf("qaTokenMsg: done streamLen=%d", len(m.qa.stream))
-			m.qa.thread = append(m.qa.thread, llm.Turn{Role: "assistant", Content: m.qa.stream})
+			debug.Logf("qaTokenMsg: done streamLen=%d mode=%s", len(m.qa.stream), m.qa.streamMode)
+			turn := llm.Turn{Role: "assistant", Content: m.qa.stream}
+			if m.qa.streamMode == "session" {
+				m.qa.sessionLog = append(m.qa.sessionLog, turn)
+			} else {
+				m.qa.nodeThreads[m.qa.streamFor] = append(m.qa.nodeThreads[m.qa.streamFor], turn)
+			}
 			m.qa.stream = ""
 			m.qa.streamCh = nil
 			return m, nil
@@ -466,12 +534,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// These bindings must work even when the Q&A input is collecting
 		// keystrokes — otherwise you'd be trapped in the input with no way
 		// to switch panes or tabs. Trade-off: literal '[' / ']' can't be
-		// typed into a Q&A question. Fine for v0.1.
+		// typed into a Q&A question.
 		switch msg.String() {
 		case "tab", "shift+tab", "alt+1", "alt+2", "alt+3", "[", "]":
 			return m.updateNav(msg)
 		}
-		if m.activePane == paneExp && m.expTab == expTabQA {
+		if m.activePane == paneExp && qaTabMode(m.expTab) != "" {
 			return m.updateQA(msg)
 		}
 		return m.updateNav(msg)
@@ -541,7 +609,10 @@ func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "?":
 		m.activePane = paneExp
-		m.expTab = expTabQA
+		// Default to node-scoped on first open; [ / ] cycles to session.
+		if qaTabMode(m.expTab) == "" {
+			m.expTab = expTabNodeQA
+		}
 		m.resetVim()
 		return m, nil
 	case "r":
@@ -799,11 +870,28 @@ func (m Model) updateQA(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if q == "" || m.qa.streamCh != nil {
 			return m, nil
 		}
-		m.qa.thread = append(m.qa.thread, llm.Turn{Role: "user", Content: q})
 		m.qa.input = ""
+
+		// Snapshot mode + node so the assistant turn lands in the right thread
+		// even if the user switches tabs or navigates mid-stream.
+		mode := qaTabMode(m.expTab)
+		id := m.currentID
+		m.qa.streamMode = mode
+		m.qa.streamFor = id
+
+		// In session mode we store the user turn with a focus tag so past
+		// turns in conversation history disambiguate which node they were
+		// about. Source is not stored here (would balloon the log); it is
+		// re-attached only to the *current* turn at send time.
+		if mode == "session" {
+			m.qa.sessionLog = append(m.qa.sessionLog, llm.Turn{Role: "user", Content: sessionTag(id) + "\n" + q})
+		} else {
+			m.qa.nodeThreads[id] = append(m.qa.nodeThreads[id], llm.Turn{Role: "user", Content: q})
+		}
+
 		ctx, cancel := context.WithCancel(context.Background())
 		m.qa.cancel = cancel
-		return m, m.askCmd(ctx, q)
+		return m, m.askCmd(ctx, id, mode, q)
 	case tea.KeyBackspace:
 		if len(m.qa.input) > 0 {
 			m.qa.input = m.qa.input[:len(m.qa.input)-1]
@@ -819,12 +907,29 @@ func (m Model) updateQA(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-func (m Model) askCmd(ctx context.Context, q string) tea.Cmd {
-	id := m.currentID
+func (m Model) askCmd(ctx context.Context, id model.NodeID, mode string, q string) tea.Cmd {
 	gen := m.gen
-	thread := append([]llm.Turn{}, m.qa.thread...)
-	thread = thread[:len(thread)-1]
-	debug.Logf("askCmd: kind=%v path=%q sym=%q histLen=%d qLen=%d", id.Kind, id.Path, id.Symbol, len(thread), len(q))
+
+	// History excludes the user turn we just appended (the provider takes the
+	// new Question as a separate field).
+	var history []llm.Turn
+	parentSummary := ""
+	if mode == "session" {
+		history = append([]llm.Turn{}, m.qa.sessionLog...)
+		history = history[:len(history)-1]
+	} else {
+		history = append([]llm.Turn{}, m.qa.nodeThreads[id]...)
+		history = history[:len(history)-1]
+		// Node mode: include parent file's prose as priming context per DESIGN.
+		if id.Kind == model.KindSymbol {
+			if pe, ok := m.expCache[model.NodeID{Kind: model.KindFile, Path: id.Path}]; ok && pe != nil {
+				parentSummary = pe.Prose
+			}
+		}
+	}
+
+	debug.Logf("askCmd: mode=%s kind=%v path=%q sym=%q histLen=%d qLen=%d", mode, id.Kind, id.Path, id.Symbol, len(history), len(q))
+
 	return func() tea.Msg {
 		var source string
 		switch id.Kind {
@@ -839,21 +944,55 @@ func (m Model) askCmd(ctx context.Context, q string) tea.Cmd {
 			s, _ := gen.SymbolSource(ctx, id.Path, id.Symbol)
 			source = s
 		}
+
+		var req llm.AskRequest
+		if mode == "session" {
+			// Self-contained question: focus tag + this turn's source +
+			// question. AskRequest.Source is empty so claude.Ask skips its
+			// stable leading-focus turn (would be wrong with per-turn focus).
+			var b strings.Builder
+			b.WriteString(sessionTag(id))
+			b.WriteString("\n\nSource:\n```\n")
+			b.WriteString(source)
+			b.WriteString("\n```\n\n")
+			b.WriteString(q)
+			req = llm.AskRequest{
+				RepoPrimer: gen.RepoPrimer,
+				History:    history,
+				Question:   b.String(),
+			}
+		} else {
+			req = llm.AskRequest{
+				FocusPath:     id.Path,
+				FocusSymbol:   id.Symbol,
+				Source:        source,
+				ParentSummary: parentSummary,
+				RepoPrimer:    gen.RepoPrimer,
+				History:       history,
+				Question:      q,
+			}
+		}
+
 		debug.Logf("askCmd: calling Provider.Ask sourceLen=%d", len(source))
-		ch, err := gen.Provider.Ask(ctx, llm.AskRequest{
-			FocusPath:   id.Path,
-			FocusSymbol: id.Symbol,
-			Source:      source,
-			RepoPrimer:  gen.RepoPrimer,
-			History:     thread,
-			Question:    q,
-		})
+		ch, err := gen.Provider.Ask(ctx, req)
 		if err != nil {
 			debug.Logf("askCmd: Provider.Ask err=%v", err)
 			return qaTokenMsg{err: err, done: true}
 		}
 		return qaStreamStarted{ch: ch}
 	}
+}
+
+func sessionTag(id model.NodeID) string {
+	var b strings.Builder
+	b.WriteString("[focus: ")
+	b.WriteString(id.Path)
+	if id.Symbol != "" {
+		b.WriteString("::")
+		b.WriteString(id.Symbol)
+	}
+	b.WriteString("]")
+	return b.String()
 }
 
 func listenQA(ch <-chan llm.Token) tea.Cmd {
@@ -975,8 +1114,8 @@ func (m Model) renderTree(w, h int) string {
 }
 
 func (m Model) renderExp(w, h int) string {
-	if m.expTab == expTabQA {
-		return m.renderQA(w, h)
+	if mode := qaTabMode(m.expTab); mode != "" {
+		return m.renderQA(mode, w, h)
 	}
 	crumbs := m.stack.Breadcrumbs()
 	var head strings.Builder
@@ -997,10 +1136,6 @@ func (m Model) renderExp(w, h int) string {
 	default:
 		if exp, ok := m.expCache[m.currentID]; ok && exp != nil {
 			prose = wrap(exp.Prose, w)
-		} else if m.currentID.Kind == model.KindDir || m.currentID.Kind == model.KindRepo {
-			prose = dimStyle.Render("(dir / repo explanations are v0.2 — descend into a file)")
-		} else if m.currentID.Path == "" {
-			prose = dimStyle.Render("(focus a file to begin)")
 		} else {
 			prose = dimStyle.Render("(no explanation yet)")
 		}
@@ -1071,17 +1206,24 @@ func (m Model) renderSource(w, h int) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func (m Model) renderQA(w, h int) string {
+func (m Model) renderQA(mode string, w, h int) string {
 	var b strings.Builder
+	// Tab title already says node vs session, so the header just shows the
+	// current focus (which the node-mode thread is keyed on, and which gets
+	// stamped onto each session-mode turn).
+	if m.currentID.Path != "" {
+		b.WriteString(dimStyle.Render(sessionTag(m.currentID)) + "\n")
+	}
 	b.WriteString(dimStyle.Render("(Esc to close, Ctrl-C to interrupt)") + "\n\n")
-	for _, t := range m.qa.thread {
+
+	for _, t := range m.qa.threadFor(mode, m.currentID) {
 		who := "you"
 		if t.Role == "assistant" {
 			who = "claude"
 		}
 		fmt.Fprintf(&b, "%s: %s\n\n", titleStyle.Render(who), wrap(t.Content, w))
 	}
-	if m.qa.stream != "" {
+	if m.qa.streamVisible(mode, m.currentID) && m.qa.stream != "" {
 		fmt.Fprintf(&b, "%s: %s\n\n", titleStyle.Render("claude"), wrap(m.qa.stream, w))
 	}
 	b.WriteString(dimStyle.Render("> ") + m.qa.input + "_")
@@ -1090,7 +1232,7 @@ func (m Model) renderQA(w, h int) string {
 
 func (m Model) renderStatus() string {
 	var keys string
-	if m.activePane == paneExp && m.expTab == expTabQA {
+	if m.activePane == paneExp && qaTabMode(m.expTab) != "" {
 		keys = "[Enter] send  [Esc] back to Explanation  [Ctrl-C] interrupt  " + dimStyle.Render("[ [ / ] ] tab  [Tab] pane")
 	} else {
 		paneKeys := ""

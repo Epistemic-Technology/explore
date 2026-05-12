@@ -48,7 +48,6 @@ Three-pane TUI (lazygit-ish):
 - `e`: open node in `$EDITOR`
 - `y`: yank path / explanation / source
 - `r`: regenerate explanation for current node
-- `T`: toggle Q&A scope (node-scoped ↔ session-wide)
 
 ### Reverse navigation = a real stack
 
@@ -143,12 +142,13 @@ host = "http://localhost:11434"
 
 ## Q&A
 
-Two modes, toggle with `T`.
+The explanation pane carries three tabs, cycled with `[` / `]`:
 
-- **Node-scoped (default):** new thread per node. Context = node source + its explanation + parent file/dir summary. Cheapest, focused. Question history persists per node.
-- **Session-wide:** one running thread. Each turn auto-attaches the *currently focused* node as fresh context (`[focus: auth/session.go::Verify]`). Lets you ask follow-ups across nodes ("how does this differ from the OAuth path we looked at?").
+- **Explanation** — the auto-generated prose for the focused node.
+- **Q&A (node)** — per-node thread. Context = node source + its explanation + parent file/dir summary. Question history persists per node. Cheapest, focused.
+- **Q&A (session)** — one running thread across the whole session. Each turn auto-attaches the *currently focused* node as fresh context (`[focus: auth/session.go::Verify]`). Lets you ask follow-ups across nodes ("how does this differ from the OAuth path we looked at?").
 
-Both modes stream tokens. `Ctrl-c` interrupts generation cleanly.
+`?` opens Q&A on the node tab; `[` / `]` flips to session. Both stream tokens; `Ctrl-c` interrupts generation cleanly.
 
 ## Data model (sketch)
 

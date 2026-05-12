@@ -51,3 +51,7 @@ Navigation is vim-ish. A few essentials:
 - `?` — open the Q&A tab (questions are scoped to the focused node)
 - `r` — regenerate the current explanation (clears the in-memory copy)
 - `q` or `ctrl+c` — quit
+
+## License
+
+MIT — see [LICENSE](LICENSE).

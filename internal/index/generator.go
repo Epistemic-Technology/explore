@@ -26,6 +26,20 @@ type Generator struct {
 	Provider   llm.Provider
 	LSP        *lsp.Client // may be nil
 	RepoPrimer string      // README + AGENTS.md, computed once
+
+	// OnUsage is invoked after every successful Provider.Explain call (cache
+	// misses only — cached entries don't bill). May be called from multiple
+	// goroutines (the prefetcher runs in parallel), so implementations must
+	// be safe for concurrent use. Optional.
+	OnUsage func(llm.Usage)
+}
+
+// reportUsage is a nil-safe helper to invoke OnUsage. Kept private so the
+// dispatch is consistent across ExplainX methods.
+func (g *Generator) reportUsage(u llm.Usage) {
+	if g.OnUsage != nil && u.Total() > 0 {
+		g.OnUsage(u)
+	}
 }
 
 // regenCtxKey is unexported so callers must go through WithRegenerate.
@@ -112,6 +126,7 @@ func (g *Generator) ExplainFile(ctx context.Context, relPath string) (*model.Exp
 	if err != nil {
 		return nil, err
 	}
+	g.reportUsage(llmExp.Usage)
 
 	exp := &model.Explanation{
 		NodeID:     model.NodeID{Kind: model.KindFile, Path: relPath},
@@ -172,6 +187,7 @@ func (g *Generator) ExplainSymbol(ctx context.Context, relPath, symbolName, file
 	if err != nil {
 		return nil, err
 	}
+	g.reportUsage(llmExp.Usage)
 	exp := &model.Explanation{
 		NodeID: model.NodeID{Kind: model.KindSymbol, Path: relPath, Symbol: symbolName},
 		Prose:  llmExp.Prose,

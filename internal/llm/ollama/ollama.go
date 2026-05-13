@@ -38,8 +38,14 @@ type chatRequest struct {
 }
 
 type chatResponse struct {
-	Message message `json:"message"`
-	Done    bool    `json:"done"`
+	Message         message `json:"message"`
+	Done            bool    `json:"done"`
+	PromptEvalCount int     `json:"prompt_eval_count"`
+	EvalCount       int     `json:"eval_count"`
+}
+
+func (r chatResponse) usage() llm.Usage {
+	return llm.Usage{InputTokens: r.PromptEvalCount, OutputTokens: r.EvalCount}
 }
 
 type Provider struct {
@@ -98,8 +104,13 @@ func (p *Provider) Explain(ctx context.Context, req llm.ExplainRequest) (*llm.Ex
 		debug.Logf("ollama.Explain: decode err=%v bodyHead=%q", err, truncate(string(body), 200))
 		return nil, fmt.Errorf("ollama: decode: %w", err)
 	}
-	debug.Logf("ollama.Explain: rawLen=%d done=%v", len(resp.Message.Content), resp.Done)
-	return llm.ParseExplainJSON(resp.Message.Content)
+	debug.Logf("ollama.Explain: rawLen=%d done=%v in=%d out=%d", len(resp.Message.Content), resp.Done, resp.PromptEvalCount, resp.EvalCount)
+	exp, err := llm.ParseExplainJSON(resp.Message.Content)
+	if err != nil {
+		return nil, err
+	}
+	exp.Usage = resp.usage()
+	return exp, nil
 }
 
 func (p *Provider) Ask(ctx context.Context, req llm.AskRequest) (<-chan llm.Token, error) {
@@ -219,12 +230,14 @@ func truncate(s string, n int) string {
 }
 
 // streamNDJSON parses Ollama's newline-delimited JSON stream, emitting each
-// message.content delta. Terminates when an object with done:true arrives.
+// message.content delta. The terminating object (done:true) carries
+// prompt_eval_count + eval_count; emit those as a final usage-only Token.
 func streamNDJSON(body io.ReadCloser, out chan<- llm.Token) {
 	defer close(out)
 	defer body.Close()
 	tokens := 0
-	defer func() { debug.Logf("ollama.streamNDJSON: done tokens=%d", tokens) }()
+	var usage llm.Usage
+	defer func() { debug.Logf("ollama.streamNDJSON: done tokens=%d in=%d out=%d", tokens, usage.InputTokens, usage.OutputTokens) }()
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -241,6 +254,11 @@ func streamNDJSON(body io.ReadCloser, out chan<- llm.Token) {
 			out <- llm.Token{Text: t}
 		}
 		if ev.Done {
+			usage = ev.usage()
+			if usage.Total() > 0 {
+				final := usage
+				out <- llm.Token{Usage: &final}
+			}
 			return
 		}
 	}

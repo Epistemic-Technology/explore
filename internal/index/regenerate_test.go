@@ -27,7 +27,10 @@ func (p *countingProvider) Explain(ctx context.Context, req llm.ExplainRequest) 
 	if prose == "" {
 		prose = "call"
 	}
-	return &llm.Explanation{Prose: prose + "-" + itoa(n)}, nil
+	return &llm.Explanation{
+		Prose: prose + "-" + itoa(n),
+		Usage: llm.Usage{InputTokens: 100, OutputTokens: 50},
+	}, nil
 }
 
 func (p *countingProvider) Ask(ctx context.Context, req llm.AskRequest) (<-chan llm.Token, error) {
@@ -111,4 +114,45 @@ func TestExplainFile_RegenerateBypassesBBoltCache(t *testing.T) {
 
 func writeFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+func TestOnUsage_FiresOnMissNotOnHit(t *testing.T) {
+	root := t.TempDir()
+	if err := writeFile(filepath.Join(root, "x.go"), "package x\n\nfunc A() {}\n"); err != nil {
+		t.Fatal(err)
+	}
+	c, err := cache.Open(filepath.Join(root, ".explore", "cache.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	p := &countingProvider{}
+	g := NewGenerator(root, c, p, nil)
+	var total llm.Usage
+	g.OnUsage = func(u llm.Usage) { total = total.Add(u) }
+
+	ctx := context.Background()
+	if _, err := g.ExplainFile(ctx, "x.go"); err != nil {
+		t.Fatal(err)
+	}
+	if got := total.Total(); got != 150 {
+		t.Fatalf("after miss: total = %d, want 150", got)
+	}
+
+	// Cache hit — OnUsage must not fire.
+	if _, err := g.ExplainFile(ctx, "x.go"); err != nil {
+		t.Fatal(err)
+	}
+	if got := total.Total(); got != 150 {
+		t.Fatalf("after hit: total = %d, want 150 (no double count)", got)
+	}
+
+	// Regenerate — OnUsage fires again.
+	if _, err := g.ExplainFile(WithRegenerate(ctx), "x.go"); err != nil {
+		t.Fatal(err)
+	}
+	if got := total.Total(); got != 300 {
+		t.Fatalf("after regen: total = %d, want 300", got)
+	}
 }

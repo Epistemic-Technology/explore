@@ -29,6 +29,7 @@ func main() {
 	openaiEndpoint := flag.String("openai-endpoint", "", "OpenAI endpoint override (e.g. Azure-compatible proxy)")
 	noLSP := flag.Bool("no-lsp", false, "disable gopls integration")
 	debugFlag := flag.Bool("debug", false, "write debug log to <cache-dir>/debug.log")
+	tokenBudget := flag.Int("token-budget", 0, "session token budget; 0 means track only (no ceiling)")
 	flag.Parse()
 
 	root := "."
@@ -91,7 +92,7 @@ func main() {
 	}
 	prefetcher := index.NewPrefetcher(gen, 0) // 0 → default concurrency (3)
 	defer prefetcher.Close()
-	m := tui.NewModel(gen, tree, prefetcher)
+	m := tui.NewModel(gen, tree, prefetcher, *tokenBudget)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fatal(err)

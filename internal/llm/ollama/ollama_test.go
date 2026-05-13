@@ -62,7 +62,7 @@ func TestAsk_ParsesNDJSONAndStopsOnDone(t *testing.T) {
 		}
 		writeLine(`{"message":{"role":"assistant","content":"Hel"},"done":false}`)
 		writeLine(`{"message":{"role":"assistant","content":"lo"},"done":false}`)
-		writeLine(`{"message":{"role":"assistant","content":""},"done":true}`)
+		writeLine(`{"message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":11,"eval_count":3}`)
 		// A trailing line after done — should be ignored.
 		writeLine(`{"message":{"role":"assistant","content":"after"},"done":false}`)
 	}))
@@ -74,14 +74,21 @@ func TestAsk_ParsesNDJSONAndStopsOnDone(t *testing.T) {
 		t.Fatalf("Ask: %v", err)
 	}
 	var got strings.Builder
+	var finalUsage *llm.Usage
 	for tok := range ch {
 		if tok.Err != nil {
 			t.Fatalf("stream err: %v", tok.Err)
 		}
 		got.WriteString(tok.Text)
+		if tok.Usage != nil {
+			finalUsage = tok.Usage
+		}
 	}
 	if got.String() != "Hello" {
 		t.Errorf("streamed text = %q, want %q", got.String(), "Hello")
+	}
+	if finalUsage == nil || finalUsage.InputTokens != 11 || finalUsage.OutputTokens != 3 {
+		t.Errorf("final usage = %+v, want {InputTokens:11 OutputTokens:3}", finalUsage)
 	}
 }
 

@@ -51,6 +51,7 @@ func (g *Generator) ExplainDir(ctx context.Context, relPath string) (*model.Expl
 	if err != nil {
 		return nil, err
 	}
+	g.reportUsage(llmExp.Usage)
 	exp := &model.Explanation{
 		NodeID: model.NodeID{Kind: model.KindDir, Path: relPath},
 		Prose:  llmExp.Prose,
@@ -94,6 +95,7 @@ func (g *Generator) ExplainRepo(ctx context.Context) (*model.Explanation, error)
 	if err != nil {
 		return nil, err
 	}
+	g.reportUsage(llmExp.Usage)
 	exp := &model.Explanation{
 		NodeID: model.NodeID{Kind: model.KindRepo, Path: ""},
 		Prose:  llmExp.Prose,

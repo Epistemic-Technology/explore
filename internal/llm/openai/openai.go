@@ -37,12 +37,26 @@ type responseFormat struct {
 	Type string `json:"type"`
 }
 
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type chatRequest struct {
 	Model          string          `json:"model"`
 	Messages       []message       `json:"messages"`
 	MaxTokens      int             `json:"max_tokens,omitempty"`
 	Stream         bool            `json:"stream,omitempty"`
+	StreamOptions  *streamOptions  `json:"stream_options,omitempty"`
 	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+}
+
+type openaiUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+}
+
+func (u openaiUsage) toLLM() llm.Usage {
+	return llm.Usage{InputTokens: u.PromptTokens, OutputTokens: u.CompletionTokens}
 }
 
 type chatResponse struct {
@@ -50,6 +64,7 @@ type chatResponse struct {
 		Message      message `json:"message"`
 		FinishReason string  `json:"finish_reason"`
 	} `json:"choices"`
+	Usage openaiUsage `json:"usage"`
 }
 
 type Provider struct {
@@ -117,8 +132,13 @@ func (p *Provider) Explain(ctx context.Context, req llm.ExplainRequest) (*llm.Ex
 		return nil, errors.New("openai: empty choices")
 	}
 	raw := resp.Choices[0].Message.Content
-	debug.Logf("openai.Explain: rawLen=%d finishReason=%q", len(raw), resp.Choices[0].FinishReason)
-	return llm.ParseExplainJSON(raw)
+	debug.Logf("openai.Explain: rawLen=%d finishReason=%q in=%d out=%d", len(raw), resp.Choices[0].FinishReason, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+	exp, err := llm.ParseExplainJSON(raw)
+	if err != nil {
+		return nil, err
+	}
+	exp.Usage = resp.Usage.toLLM()
+	return exp, nil
 }
 
 func (p *Provider) Ask(ctx context.Context, req llm.AskRequest) (<-chan llm.Token, error) {
@@ -147,10 +167,11 @@ func (p *Provider) Ask(ctx context.Context, req llm.AskRequest) (<-chan llm.Toke
 	msgs = append(msgs, message{Role: "user", Content: req.Question})
 
 	apiReq := chatRequest{
-		Model:     p.model,
-		Messages:  msgs,
-		MaxTokens: defaultMax,
-		Stream:    true,
+		Model:         p.model,
+		Messages:      msgs,
+		MaxTokens:     defaultMax,
+		Stream:        true,
+		StreamOptions: &streamOptions{IncludeUsage: true},
 	}
 	b, err := json.Marshal(apiReq)
 	if err != nil {
@@ -277,12 +298,15 @@ func truncate(s string, n int) string {
 }
 
 // streamSSE parses OpenAI's event stream and emits choices[0].delta.content
-// tokens. Closes out and the body when done. Terminates on "data: [DONE]".
+// tokens. Closes out and the body when done. When stream_options.include_usage
+// is set, the chunk just before "[DONE]" has an empty choices list and a
+// usage field — that becomes a final usage-only Token.
 func streamSSE(body io.ReadCloser, out chan<- llm.Token) {
 	defer close(out)
 	defer body.Close()
 	tokens := 0
-	defer func() { debug.Logf("openai.streamSSE: done tokens=%d", tokens) }()
+	var usage llm.Usage
+	defer func() { debug.Logf("openai.streamSSE: done tokens=%d in=%d out=%d", tokens, usage.InputTokens, usage.OutputTokens) }()
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -295,7 +319,7 @@ func streamSSE(body io.ReadCloser, out chan<- llm.Token) {
 			continue
 		}
 		if data == "[DONE]" {
-			return
+			break
 		}
 		var ev struct {
 			Choices []struct {
@@ -303,9 +327,13 @@ func streamSSE(body io.ReadCloser, out chan<- llm.Token) {
 					Content string `json:"content"`
 				} `json:"delta"`
 			} `json:"choices"`
+			Usage *openaiUsage `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(data), &ev); err != nil {
 			continue
+		}
+		if ev.Usage != nil {
+			usage = ev.Usage.toLLM()
 		}
 		if len(ev.Choices) == 0 {
 			continue
@@ -318,5 +346,10 @@ func streamSSE(body io.ReadCloser, out chan<- llm.Token) {
 	if err := sc.Err(); err != nil {
 		debug.Logf("openai.streamSSE: scanner err=%v", err)
 		out <- llm.Token{Err: err}
+		return
+	}
+	if usage.Total() > 0 {
+		final := usage
+		out <- llm.Token{Usage: &final}
 	}
 }

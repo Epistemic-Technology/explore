@@ -47,6 +47,31 @@ type ExplainRequest struct {
 type Explanation struct {
 	Prose    string
 	Metadata Metadata
+	Usage    Usage
+}
+
+// Usage is per-call token accounting. Providers fill in whatever their API
+// reports; unsupported fields stay zero. CacheRead / CacheCreation are
+// Claude-specific (prompt caching); other providers leave them at zero.
+type Usage struct {
+	InputTokens         int
+	OutputTokens        int
+	CacheReadTokens     int
+	CacheCreationTokens int
+}
+
+// Total counts every input + output token. CacheRead/CacheCreation overlap
+// with InputTokens in Claude's accounting, so they're informational only.
+func (u Usage) Total() int { return u.InputTokens + u.OutputTokens }
+
+// Add merges two usages by component-wise sum.
+func (u Usage) Add(o Usage) Usage {
+	return Usage{
+		InputTokens:         u.InputTokens + o.InputTokens,
+		OutputTokens:        u.OutputTokens + o.OutputTokens,
+		CacheReadTokens:     u.CacheReadTokens + o.CacheReadTokens,
+		CacheCreationTokens: u.CacheCreationTokens + o.CacheCreationTokens,
+	}
 }
 
 type Metadata struct {
@@ -79,10 +104,13 @@ type Turn struct {
 	Content string
 }
 
-// Token is one streamed delta from Ask.
+// Token is one streamed delta from Ask. Most tokens carry only Text; the
+// final token of a stream may have Usage set instead of (or in addition to)
+// text — providers emit this once the underlying API reports counts.
 type Token struct {
-	Text string
-	Err  error
+	Text  string
+	Err   error
+	Usage *Usage
 }
 
 type Provider interface {

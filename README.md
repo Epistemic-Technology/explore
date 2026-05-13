@@ -41,8 +41,11 @@ Flags:
 - `--model <id>` — override the model (provider-specific default if empty)
 - `--ollama-host <url>` — Ollama host (default: `$OLLAMA_HOST` or `http://localhost:11434`)
 - `--openai-endpoint <url>` — OpenAI endpoint override (e.g. Azure-compatible proxy)
+- `--token-budget <N>` — session token ceiling for the status-bar indicator; 0 means track-only
 - `--no-lsp` — skip launching `gopls`
 - `--debug` — write a debug log to `<cache-dir>/debug.log`
+
+The status bar shows a running `tok: 12.3k` total once any LLM call lands. With `--token-budget` set, the figure becomes `12.3k/100k (12%)` and turns yellow at 80%, red at 100%. Cached explanations (no new LLM call) don't add to the count.
 
 The cache key includes the model name, so switching providers (or models) never returns stale explanations from a previous run.
 

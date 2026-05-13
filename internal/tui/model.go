@@ -106,6 +106,14 @@ type Model struct {
 	// Search overlay state; populated lazily on first `/`.
 	search searchUI
 
+	// Running token totals across the session. Updated when the Generator
+	// reports usage via the usageCh (Explain calls, including prefetcher) and
+	// when QA streams emit a final usage token. tokenBudget is the configured
+	// ceiling; 0 means "no budget, just track and display".
+	usage       llm.Usage
+	usageCh     chan llm.Usage
+	tokenBudget int
+
 	// Vim-style count prefix (e.g. 5j) and pending "g" awaiting a second "g".
 	count    int
 	pendingG bool
@@ -163,7 +171,16 @@ func (q *qaState) streamVisible(mode string, id model.NodeID) bool {
 	return true
 }
 
-func NewModel(gen *index.Generator, tree *Tree, prefetcher *index.Prefetcher) Model {
+func NewModel(gen *index.Generator, tree *Tree, prefetcher *index.Prefetcher, tokenBudget int) Model {
+	usageCh := make(chan llm.Usage, 64)
+	// Non-blocking send: the channel is sized for typical burstiness, but if
+	// it somehow saturates we'd rather undercount than stall an LLM call.
+	gen.OnUsage = func(u llm.Usage) {
+		select {
+		case usageCh <- u:
+		default:
+		}
+	}
 	m := Model{
 		gen:         gen,
 		tree:        tree,
@@ -176,6 +193,8 @@ func NewModel(gen *index.Generator, tree *Tree, prefetcher *index.Prefetcher) Mo
 		qa: qaState{
 			nodeThreads: make(map[model.NodeID][]llm.Turn),
 		},
+		usageCh:     usageCh,
+		tokenBudget: tokenBudget,
 	}
 	if rows := tree.Rows(); len(rows) > 0 {
 		m.cursor = 0
@@ -194,6 +213,9 @@ func (m Model) Init() tea.Cmd {
 	var cmds []tea.Cmd
 	if m.initialCmd != nil {
 		cmds = append(cmds, m.initialCmd)
+	}
+	if m.usageCh != nil {
+		cmds = append(cmds, listenUsage(m.usageCh))
 	}
 	if m.prefetcher != nil {
 		cmds = append(cmds, listenPrefetch(m.prefetcher.Updates()))
@@ -220,9 +242,17 @@ type debouncedLoadMsg struct {
 }
 
 type qaTokenMsg struct {
-	text string
-	done bool
-	err  error
+	text  string
+	done  bool
+	err   error
+	usage *llm.Usage
+}
+
+// usageMsg is delivered each time the Generator reports a successful
+// Provider.Explain call (cache misses only). The handler accumulates onto
+// m.usage.
+type usageMsg struct {
+	u llm.Usage
 }
 
 type qaStreamStarted struct {
@@ -242,6 +272,19 @@ func listenPrefetch(ch <-chan index.Update) tea.Cmd {
 			return prefetchClosedMsg{}
 		}
 		return prefetchUpdateMsg{update: u}
+	}
+}
+
+func listenUsage(ch <-chan llm.Usage) tea.Cmd {
+	if ch == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		u, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return usageMsg{u: u}
 	}
 }
 
@@ -631,6 +674,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, listenQA(msg.ch)
 
 	case qaTokenMsg:
+		if msg.usage != nil {
+			m.usage = m.usage.Add(*msg.usage)
+		}
 		if msg.err != nil {
 			debug.Logf("qaTokenMsg: err=%v", msg.err)
 			m.qa.stream += "\n[error: " + msg.err.Error() + "]"
@@ -658,6 +704,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.search.indexErr = msg.err
 		m.refreshSearch()
 		return m, nil
+
+	case usageMsg:
+		m.usage = m.usage.Add(msg.u)
+		debug.Logf("usageMsg: total in=%d out=%d", m.usage.InputTokens, m.usage.OutputTokens)
+		return m, listenUsage(m.usageCh)
 
 	case tea.KeyMsg:
 		// Search overlay swallows all input (except via its own exit keys) so
@@ -1145,13 +1196,18 @@ func listenQA(ch <-chan llm.Token) tea.Cmd {
 		if tok.Err != nil {
 			return qaTokenMsg{err: tok.Err}
 		}
-		return qaTokenMsg{text: tok.Text}
+		// A usage-only token (no text) is the provider's final report; pass it
+		// through but flag it as an empty-text message so the streaming buffer
+		// doesn't get an extra newline.
+		return qaTokenMsg{text: tok.Text, usage: tok.Usage}
 	}
 }
 
 // --- Rendering ---
 
 var (
+	cautionStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
+	warnStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
 	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	titleInactive = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
@@ -1415,7 +1471,72 @@ func (m Model) renderStatus() string {
 		}
 		keys = paneKeys + dimStyle.Render("  •  [Alt+1-3/Tab] pane  [ [ / ] ] tab  [b] back  [?] ask  [r] regen  [q] quit")
 	}
-	return keys + "  " + m.statusMsg
+	return keys + "  " + m.renderUsage() + m.statusMsg
+}
+
+// renderUsage formats the session's running token total for the status bar.
+// With a budget set, the percentage turns yellow at 80% and red at 100%.
+// With no budget, just shows "tok: 12.3k".
+func (m Model) renderUsage() string {
+	if m.usage.Total() == 0 {
+		return ""
+	}
+	body := "tok: " + formatTokenCount(m.usage.Total())
+	if m.tokenBudget > 0 {
+		pct := (m.usage.Total() * 100) / m.tokenBudget
+		body += "/" + formatTokenCount(m.tokenBudget) + " (" + itoaInt(pct) + "%)"
+		switch {
+		case pct >= 100:
+			body = warnStyle.Render(body)
+		case pct >= 80:
+			body = cautionStyle.Render(body)
+		default:
+			body = dimStyle.Render(body)
+		}
+	} else {
+		body = dimStyle.Render(body)
+	}
+	return body + "  "
+}
+
+func formatTokenCount(n int) string {
+	switch {
+	case n >= 1_000_000:
+		return formatThousands(n/1000) + "k"
+	case n >= 10_000:
+		return itoaInt(n/1000) + "k"
+	case n >= 1000:
+		// One-decimal "1.2k" presentation.
+		whole := n / 1000
+		tenths := (n % 1000) / 100
+		return itoaInt(whole) + "." + itoaInt(tenths) + "k"
+	}
+	return itoaInt(n)
+}
+
+func formatThousands(n int) string { return itoaInt(n) }
+
+func itoaInt(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := false
+	if n < 0 {
+		neg = true
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
 }
 
 // --- Util ---

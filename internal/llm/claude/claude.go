@@ -58,7 +58,24 @@ type messagesResponse struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	} `json:"content"`
-	StopReason string `json:"stop_reason"`
+	StopReason string         `json:"stop_reason"`
+	Usage      anthropicUsage `json:"usage"`
+}
+
+type anthropicUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+}
+
+func (a anthropicUsage) toLLM() llm.Usage {
+	return llm.Usage{
+		InputTokens:         a.InputTokens,
+		OutputTokens:        a.OutputTokens,
+		CacheReadTokens:     a.CacheReadInputTokens,
+		CacheCreationTokens: a.CacheCreationInputTokens,
+	}
 }
 
 type Provider struct {
@@ -126,8 +143,13 @@ func (p *Provider) Explain(ctx context.Context, req llm.ExplainRequest) (*llm.Ex
 			raw.WriteString(c.Text)
 		}
 	}
-	debug.Logf("claude.Explain: rawLen=%d stopReason=%q", raw.Len(), resp.StopReason)
-	return llm.ParseExplainJSON(raw.String())
+	debug.Logf("claude.Explain: rawLen=%d stopReason=%q in=%d out=%d cacheRead=%d", raw.Len(), resp.StopReason, resp.Usage.InputTokens, resp.Usage.OutputTokens, resp.Usage.CacheReadInputTokens)
+	exp, err := llm.ParseExplainJSON(raw.String())
+	if err != nil {
+		return nil, err
+	}
+	exp.Usage = resp.Usage.toLLM()
+	return exp, nil
 }
 
 func (p *Provider) post(ctx context.Context, req any) ([]byte, error) {
@@ -301,13 +323,16 @@ func (p *Provider) Ask(ctx context.Context, req llm.AskRequest) (<-chan llm.Toke
 	return out, nil
 }
 
-// streamSSE parses Anthropic's event stream and emits content_block_delta text
-// to out. Closes out and the body when done.
+// streamSSE parses Anthropic's event stream. Emits content_block_delta text
+// to out as it arrives, accumulates usage from message_start (input tokens +
+// cache reads) and message_delta (output tokens), and emits a final
+// usage-only Token before closing.
 func streamSSE(body io.ReadCloser, out chan<- llm.Token) {
 	defer close(out)
 	defer body.Close()
 	tokens := 0
-	defer func() { debug.Logf("claude.streamSSE: done tokens=%d", tokens) }()
+	var usage llm.Usage
+	defer func() { debug.Logf("claude.streamSSE: done tokens=%d in=%d out=%d", tokens, usage.InputTokens, usage.OutputTokens) }()
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -320,7 +345,11 @@ func streamSSE(body io.ReadCloser, out chan<- llm.Token) {
 			continue
 		}
 		var ev struct {
-			Type  string `json:"type"`
+			Type    string `json:"type"`
+			Message struct {
+				Usage anthropicUsage `json:"usage"`
+			} `json:"message"`
+			Usage anthropicUsage `json:"usage"`
 			Delta struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
@@ -329,13 +358,28 @@ func streamSSE(body io.ReadCloser, out chan<- llm.Token) {
 		if err := json.Unmarshal([]byte(data), &ev); err != nil {
 			continue
 		}
-		if ev.Type == "content_block_delta" && ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
-			tokens++
-			out <- llm.Token{Text: ev.Delta.Text}
+		switch ev.Type {
+		case "message_start":
+			// message_start.usage carries input/cache counts.
+			u := ev.Message.Usage.toLLM()
+			usage = usage.Add(u)
+		case "message_delta":
+			// message_delta.usage updates output count (cumulative, not delta).
+			usage.OutputTokens = ev.Usage.OutputTokens
+		case "content_block_delta":
+			if ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
+				tokens++
+				out <- llm.Token{Text: ev.Delta.Text}
+			}
 		}
 	}
 	if err := sc.Err(); err != nil {
 		debug.Logf("claude.streamSSE: scanner err=%v", err)
 		out <- llm.Token{Err: err}
+		return
+	}
+	if usage.Total() > 0 {
+		final := usage
+		out <- llm.Token{Usage: &final}
 	}
 }

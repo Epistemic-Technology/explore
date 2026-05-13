@@ -47,6 +47,34 @@ Flags:
 
 The status bar shows a running `tok: 12.3k` total once any LLM call lands. With `--token-budget` set, the figure becomes `12.3k/100k (12%)` and turns yellow at 80%, red at 100%. Cached explanations (no new LLM call) don't add to the count.
 
+## Config file
+
+Settings can be persisted to `~/.config/explore/config.toml` (or `$XDG_CONFIG_HOME/explore/config.toml`). CLI flags override file values; file values override defaults.
+
+```toml
+[provider]
+default = "claude"
+
+[provider.claude]
+model = "claude-sonnet-4-6"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[provider.openai]
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+# endpoint = "https://my-azure-proxy.example.com/v1/chat/completions"
+
+[provider.ollama]
+model = "qwen2.5-coder:14b"
+host = "http://localhost:11434"
+
+[ui]
+token_budget = 0      # 0 = track only, no ceiling
+no_lsp = false
+```
+
+Use `--config <path>` to point at a different file. A missing file is fine (defaults apply); a malformed file is fatal so typos surface immediately.
+
 The cache key includes the model name, so switching providers (or models) never returns stale explanations from a previous run.
 
 Explanations are content-hash cached, so re-opening a file or symbol is free until the source changes.

@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/mikethicke/explore/internal/cache"
+	"github.com/mikethicke/explore/internal/config"
 	"github.com/mikethicke/explore/internal/debug"
 	"github.com/mikethicke/explore/internal/index"
 	"github.com/mikethicke/explore/internal/llm"
@@ -22,14 +23,17 @@ import (
 )
 
 func main() {
+	// CLI flags default to "" / 0 so an unset flag means "use config or
+	// built-in default", not "override with the zero value".
 	cacheDir := flag.String("cache-dir", "", "override cache directory (default: <repo>/.explore)")
-	providerName := flag.String("provider", "claude", "LLM provider: claude | openai | ollama")
+	configPath := flag.String("config", "", "config file path (default: $XDG_CONFIG_HOME/explore/config.toml or ~/.config/explore/config.toml)")
+	providerName := flag.String("provider", "", "LLM provider: claude | openai | ollama (default from config)")
 	model := flag.String("model", "", "override model name (provider-specific default if empty)")
-	ollamaHost := flag.String("ollama-host", "", "Ollama host (default: $OLLAMA_HOST or http://localhost:11434)")
-	openaiEndpoint := flag.String("openai-endpoint", "", "OpenAI endpoint override (e.g. Azure-compatible proxy)")
+	ollamaHost := flag.String("ollama-host", "", "Ollama host (default from config or $OLLAMA_HOST)")
+	openaiEndpoint := flag.String("openai-endpoint", "", "OpenAI endpoint override (default from config)")
 	noLSP := flag.Bool("no-lsp", false, "disable gopls integration")
 	debugFlag := flag.Bool("debug", false, "write debug log to <cache-dir>/debug.log")
-	tokenBudget := flag.Int("token-budget", 0, "session token budget; 0 means track only (no ceiling)")
+	tokenBudget := flag.Int("token-budget", -1, "session token budget; 0 = track only, -1 = use config default")
 	flag.Parse()
 
 	root := "."
@@ -42,6 +46,38 @@ func main() {
 	}
 	if st, err := os.Stat(absRoot); err != nil || !st.IsDir() {
 		fatal(fmt.Errorf("not a directory: %s", absRoot))
+	}
+
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		fatal(err)
+	}
+	// Apply CLI overrides on top of the file/default values. Empty strings
+	// and -1 ints are sentinels for "flag not set".
+	if *providerName != "" {
+		cfg.Provider.Default = *providerName
+	}
+	if *model != "" {
+		switch cfg.Provider.Default {
+		case "openai":
+			cfg.Provider.OpenAI.Model = *model
+		case "ollama":
+			cfg.Provider.Ollama.Model = *model
+		default:
+			cfg.Provider.Claude.Model = *model
+		}
+	}
+	if *ollamaHost != "" {
+		cfg.Provider.Ollama.Host = *ollamaHost
+	}
+	if *openaiEndpoint != "" {
+		cfg.Provider.OpenAI.Endpoint = *openaiEndpoint
+	}
+	if *tokenBudget >= 0 {
+		cfg.UI.TokenBudget = *tokenBudget
+	}
+	if *noLSP {
+		cfg.UI.NoLSP = true
 	}
 
 	cachePath := *cacheDir
@@ -66,14 +102,14 @@ func main() {
 		}
 	}
 
-	provider, err := buildProvider(*providerName, *model, *ollamaHost, *openaiEndpoint)
+	provider, err := buildProvider(cfg)
 	if err != nil {
 		fatal(err)
 	}
-	debug.Logf("startup: provider=%s model=%q root=%q", provider.Name(), provider.Model(), absRoot)
+	debug.Logf("startup: provider=%s model=%q root=%q tokenBudget=%d", provider.Name(), provider.Model(), absRoot, cfg.UI.TokenBudget)
 
 	var lspClient *lsp.Client
-	if !*noLSP {
+	if !cfg.UI.NoLSP {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		lspClient, err = lsp.Start(ctx, "gopls", absRoot)
@@ -92,7 +128,7 @@ func main() {
 	}
 	prefetcher := index.NewPrefetcher(gen, 0) // 0 → default concurrency (3)
 	defer prefetcher.Close()
-	m := tui.NewModel(gen, tree, prefetcher, *tokenBudget)
+	m := tui.NewModel(gen, tree, prefetcher, cfg.UI.TokenBudget)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fatal(err)
@@ -104,30 +140,45 @@ func fatal(err error) {
 	os.Exit(1)
 }
 
-// buildProvider picks an llm.Provider from --provider plus env-fallback secrets.
-// Missing API keys are a warning, not a fatal — the TUI still launches and
-// renders the file tree; explanations fail at request time with a clear error.
-func buildProvider(name, model, ollamaHost, openaiEndpoint string) (llm.Provider, error) {
-	switch name {
+// loadConfig resolves the config path (CLI override or DefaultPath) and
+// loads it. Missing file → silent default; parse error → fatal so typos are loud.
+func loadConfig(path string) (config.Config, error) {
+	if path == "" {
+		p, err := config.DefaultPath()
+		if err != nil {
+			return config.Default(), nil
+		}
+		path = p
+	}
+	return config.Load(path)
+}
+
+// buildProvider picks an llm.Provider from the resolved config. Missing API
+// keys are a warning, not a fatal — the TUI still launches and renders the
+// file tree; explanations fail at request time with a clear error.
+func buildProvider(cfg config.Config) (llm.Provider, error) {
+	switch cfg.Provider.Default {
 	case "claude", "":
-		key := os.Getenv("ANTHROPIC_API_KEY")
+		env := cfg.Provider.Claude.APIKeyEnv
+		key := os.Getenv(env)
 		if key == "" {
-			fmt.Fprintln(os.Stderr, "warning: ANTHROPIC_API_KEY not set — explanations will fail.")
+			fmt.Fprintf(os.Stderr, "warning: %s not set — explanations will fail.\n", env)
 		}
-		return claude.New(key, model), nil
+		return claude.New(key, cfg.Provider.Claude.Model), nil
 	case "openai":
-		key := os.Getenv("OPENAI_API_KEY")
+		env := cfg.Provider.OpenAI.APIKeyEnv
+		key := os.Getenv(env)
 		if key == "" {
-			fmt.Fprintln(os.Stderr, "warning: OPENAI_API_KEY not set — explanations will fail.")
+			fmt.Fprintf(os.Stderr, "warning: %s not set — explanations will fail.\n", env)
 		}
-		return openai.New(key, model, openaiEndpoint), nil
+		return openai.New(key, cfg.Provider.OpenAI.Model, cfg.Provider.OpenAI.Endpoint), nil
 	case "ollama":
-		host := ollamaHost
+		host := cfg.Provider.Ollama.Host
 		if host == "" {
 			host = os.Getenv("OLLAMA_HOST")
 		}
-		return ollama.New(model, host), nil
+		return ollama.New(cfg.Provider.Ollama.Model, host), nil
 	default:
-		return nil, fmt.Errorf("unknown provider %q (want: claude | openai | ollama)", name)
+		return nil, fmt.Errorf("unknown provider %q (want: claude | openai | ollama)", cfg.Provider.Default)
 	}
 }

@@ -79,27 +79,9 @@ func New(apiKey, model string) *Provider {
 	}
 }
 
-func (p *Provider) Name() string                  { return "claude" }
-func (p *Provider) Model() string                 { return p.model }
-func (p *Provider) SupportsPromptCaching() bool   { return true }
-
-const systemPromptExplain = `You are explore, an assistant that explains code at multiple zoom levels for a developer reading an unfamiliar codebase.
-
-Rules:
-- Be concrete. Reference identifiers from the source. Avoid generic phrases like "this code does X".
-- Prose: 3-6 sentences, plain text, no headings. Lead with purpose, then mechanism, then anything surprising.
-- Output strict JSON only, no markdown fences, matching:
-  {"prose": "...", "metadata": {"imports": [], "key_types": [], "gotchas": []}}
-- key_types: 0-5 most important types/structs the reader should know about.
-- gotchas: 0-3 non-obvious behaviors, footguns, or invariants — only if real.
-- If the snippet is trivial, say so briefly and keep metadata arrays empty.`
-
-const systemPromptAsk = `You are explore, helping a developer understand a specific piece of code they are looking at.
-
-Rules:
-- Answer the user's question grounded in the provided source. Quote identifiers verbatim.
-- If the answer is not derivable from the source provided, say so and suggest what to look at next.
-- Be concise. Plain prose, no JSON wrapper. Use short paragraphs and inline code spans for symbols.`
+func (p *Provider) Name() string                { return "claude" }
+func (p *Provider) Model() string               { return p.model }
+func (p *Provider) SupportsPromptCaching() bool { return true }
 
 func (p *Provider) Explain(ctx context.Context, req llm.ExplainRequest) (*llm.Explanation, error) {
 	if p.apiKey == "" {
@@ -109,7 +91,7 @@ func (p *Provider) Explain(ctx context.Context, req llm.ExplainRequest) (*llm.Ex
 	debug.Logf("claude.Explain: start level=%s path=%q sym=%q sourceLen=%d primerLen=%d model=%q", req.Level, req.Path, req.Symbol, len(req.Source), len(req.RepoPrimer), p.model)
 
 	system := []contentBlock{
-		{Type: "text", Text: systemPromptExplain, CacheControl: &cacheControl{Type: "ephemeral"}},
+		{Type: "text", Text: llm.SystemPromptExplain, CacheControl: &cacheControl{Type: "ephemeral"}},
 	}
 	if req.RepoPrimer != "" {
 		system = append(system, contentBlock{
@@ -119,7 +101,7 @@ func (p *Provider) Explain(ctx context.Context, req llm.ExplainRequest) (*llm.Ex
 		})
 	}
 
-	user := buildExplainUserMessage(req)
+	user := llm.BuildExplainUser(req)
 	apiReq := messagesRequest{
 		Model:     p.model,
 		System:    system,
@@ -145,59 +127,7 @@ func (p *Provider) Explain(ctx context.Context, req llm.ExplainRequest) (*llm.Ex
 		}
 	}
 	debug.Logf("claude.Explain: rawLen=%d stopReason=%q", raw.Len(), resp.StopReason)
-	return parseExplainJSON(raw.String())
-}
-
-func buildExplainUserMessage(req llm.ExplainRequest) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "Level: %s\nPath: %s\n", req.Level, req.Path)
-	if req.Symbol != "" {
-		fmt.Fprintf(&b, "Symbol: %s\n", req.Symbol)
-	}
-	if req.Signature != "" {
-		fmt.Fprintf(&b, "Signature: %s\n", req.Signature)
-	}
-	if len(req.Imports) > 0 {
-		fmt.Fprintf(&b, "Imports: %s\n", strings.Join(req.Imports, ", "))
-	}
-	if len(req.Callers) > 0 {
-		fmt.Fprintf(&b, "Callers: %s\n", strings.Join(req.Callers, ", "))
-	}
-	if len(req.Callees) > 0 {
-		fmt.Fprintf(&b, "Callees: %s\n", strings.Join(req.Callees, ", "))
-	}
-	if req.ParentSummary != "" {
-		fmt.Fprintf(&b, "Parent summary: %s\n", req.ParentSummary)
-	}
-	b.WriteString("\nSource:\n```\n")
-	b.WriteString(req.Source)
-	b.WriteString("\n```\n")
-	b.WriteString("\nReturn only the JSON object described in the system prompt.")
-	return b.String()
-}
-
-// parseExplainJSON tolerates a stray code fence around the JSON object.
-func parseExplainJSON(s string) (*llm.Explanation, error) {
-	s = strings.TrimSpace(s)
-	// Strip leading/trailing ``` fences if the model added them.
-	if strings.HasPrefix(s, "```") {
-		if i := strings.Index(s, "\n"); i >= 0 {
-			s = s[i+1:]
-		}
-		if j := strings.LastIndex(s, "```"); j >= 0 {
-			s = s[:j]
-		}
-		s = strings.TrimSpace(s)
-	}
-	var parsed struct {
-		Prose    string       `json:"prose"`
-		Metadata llm.Metadata `json:"metadata"`
-	}
-	if err := json.Unmarshal([]byte(s), &parsed); err != nil {
-		// Fall back to treating the whole response as prose so the UI is never empty.
-		return &llm.Explanation{Prose: s}, nil
-	}
-	return &llm.Explanation{Prose: parsed.Prose, Metadata: parsed.Metadata}, nil
+	return llm.ParseExplainJSON(raw.String())
 }
 
 func (p *Provider) post(ctx context.Context, req any) ([]byte, error) {
@@ -324,7 +254,7 @@ func (p *Provider) Ask(ctx context.Context, req llm.AskRequest) (<-chan llm.Toke
 	debug.Logf("claude.Ask: start path=%q sym=%q histLen=%d qLen=%d sourceLen=%d", req.FocusPath, req.FocusSymbol, len(req.History), len(req.Question), len(req.Source))
 
 	system := []contentBlock{
-		{Type: "text", Text: systemPromptAsk, CacheControl: &cacheControl{Type: "ephemeral"}},
+		{Type: "text", Text: llm.SystemPromptAsk, CacheControl: &cacheControl{Type: "ephemeral"}},
 	}
 	if req.RepoPrimer != "" {
 		system = append(system, contentBlock{
@@ -340,7 +270,7 @@ func (p *Provider) Ask(ctx context.Context, req llm.AskRequest) (<-chan llm.Toke
 	// Source empty because each turn carries its own focus tag + source inside
 	// req.Question — see internal/tui askCmd.
 	if req.Source != "" {
-		focus := buildAskFocus(req)
+		focus := llm.BuildAskFocus(req)
 		msgs = append(msgs, message{Role: "user", Content: []contentBlock{{Type: "text", Text: focus}}})
 		msgs = append(msgs, message{Role: "assistant", Content: []contentBlock{{Type: "text", Text: "Ready."}}})
 	}
@@ -369,22 +299,6 @@ func (p *Provider) Ask(ctx context.Context, req llm.AskRequest) (<-chan llm.Toke
 	out := make(chan llm.Token, 16)
 	go streamSSE(resp.Body, out)
 	return out, nil
-}
-
-func buildAskFocus(req llm.AskRequest) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "Focus: %s", req.FocusPath)
-	if req.FocusSymbol != "" {
-		fmt.Fprintf(&b, "::%s", req.FocusSymbol)
-	}
-	b.WriteString("\n")
-	if req.ParentSummary != "" {
-		fmt.Fprintf(&b, "Parent summary: %s\n", req.ParentSummary)
-	}
-	b.WriteString("\nSource:\n```\n")
-	b.WriteString(req.Source)
-	b.WriteString("\n```\n")
-	return b.String()
 }
 
 // streamSSE parses Anthropic's event stream and emits content_block_delta text

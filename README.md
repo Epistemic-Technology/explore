@@ -5,7 +5,10 @@ Implemented in go / [Bubble Tea](https://github.com/charmbracelet/bubbletea).
 ## Requirements
 
 - Go 1.26+
-- An Anthropic API key in `ANTHROPIC_API_KEY` (explanations call Claude directly)
+- One of:
+  - **Claude** (default): `ANTHROPIC_API_KEY`
+  - **OpenAI**: `OPENAI_API_KEY` plus `--provider openai`
+  - **Ollama**: a local Ollama server (defaults to `http://localhost:11434`), `--provider ollama`
 - `gopls` on `PATH` for caller/callee lookups (optional; xref is disabled without it)
 
 v0.1 only parses Go source. Other languages still show the file tree but produce no symbol-level explanations.
@@ -26,15 +29,22 @@ go build -o explore ./cmd/explore
 
 ```sh
 export ANTHROPIC_API_KEY=sk-ant-...
-explore [path]              # defaults to current directory
+explore [path]                                # Claude (default)
+explore --provider openai [path]              # OPENAI_API_KEY required
+explore --provider ollama --model qwen2.5-coder:14b [path]
 ```
 
 Flags:
 
 - `--cache-dir <dir>` — override the BBolt cache location (default `<repo>/.explore/cache.db`)
-- `--model <id>` — override the Claude model (default `claude-sonnet-4-6`)
+- `--provider <claude|openai|ollama>` — pick an LLM backend (default `claude`)
+- `--model <id>` — override the model (provider-specific default if empty)
+- `--ollama-host <url>` — Ollama host (default: `$OLLAMA_HOST` or `http://localhost:11434`)
+- `--openai-endpoint <url>` — OpenAI endpoint override (e.g. Azure-compatible proxy)
 - `--no-lsp` — skip launching `gopls`
 - `--debug` — write a debug log to `<cache-dir>/debug.log`
+
+The cache key includes the model name, so switching providers (or models) never returns stale explanations from a previous run.
 
 Explanations are content-hash cached, so re-opening a file or symbol is free until the source changes.
 

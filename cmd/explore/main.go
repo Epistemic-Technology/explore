@@ -13,14 +13,20 @@ import (
 	"github.com/mikethicke/explore/internal/cache"
 	"github.com/mikethicke/explore/internal/debug"
 	"github.com/mikethicke/explore/internal/index"
+	"github.com/mikethicke/explore/internal/llm"
 	"github.com/mikethicke/explore/internal/llm/claude"
+	"github.com/mikethicke/explore/internal/llm/ollama"
+	"github.com/mikethicke/explore/internal/llm/openai"
 	"github.com/mikethicke/explore/internal/lsp"
 	"github.com/mikethicke/explore/internal/tui"
 )
 
 func main() {
 	cacheDir := flag.String("cache-dir", "", "override cache directory (default: <repo>/.explore)")
-	model := flag.String("model", "", "override Claude model (default: claude-sonnet-4-6)")
+	providerName := flag.String("provider", "claude", "LLM provider: claude | openai | ollama")
+	model := flag.String("model", "", "override model name (provider-specific default if empty)")
+	ollamaHost := flag.String("ollama-host", "", "Ollama host (default: $OLLAMA_HOST or http://localhost:11434)")
+	openaiEndpoint := flag.String("openai-endpoint", "", "OpenAI endpoint override (e.g. Azure-compatible proxy)")
 	noLSP := flag.Bool("no-lsp", false, "disable gopls integration")
 	debugFlag := flag.Bool("debug", false, "write debug log to <cache-dir>/debug.log")
 	flag.Parse()
@@ -59,14 +65,11 @@ func main() {
 		}
 	}
 
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "warning: ANTHROPIC_API_KEY not set — explanations will fail.")
-		debug.Logf("startup: ANTHROPIC_API_KEY is empty")
-	} else {
-		debug.Logf("startup: API key present (len=%d), model=%q, root=%q", len(apiKey), *model, absRoot)
+	provider, err := buildProvider(*providerName, *model, *ollamaHost, *openaiEndpoint)
+	if err != nil {
+		fatal(err)
 	}
-	provider := claude.New(apiKey, *model)
+	debug.Logf("startup: provider=%s model=%q root=%q", provider.Name(), provider.Model(), absRoot)
 
 	var lspClient *lsp.Client
 	if !*noLSP {
@@ -98,4 +101,32 @@ func main() {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "explore:", err)
 	os.Exit(1)
+}
+
+// buildProvider picks an llm.Provider from --provider plus env-fallback secrets.
+// Missing API keys are a warning, not a fatal — the TUI still launches and
+// renders the file tree; explanations fail at request time with a clear error.
+func buildProvider(name, model, ollamaHost, openaiEndpoint string) (llm.Provider, error) {
+	switch name {
+	case "claude", "":
+		key := os.Getenv("ANTHROPIC_API_KEY")
+		if key == "" {
+			fmt.Fprintln(os.Stderr, "warning: ANTHROPIC_API_KEY not set — explanations will fail.")
+		}
+		return claude.New(key, model), nil
+	case "openai":
+		key := os.Getenv("OPENAI_API_KEY")
+		if key == "" {
+			fmt.Fprintln(os.Stderr, "warning: OPENAI_API_KEY not set — explanations will fail.")
+		}
+		return openai.New(key, model, openaiEndpoint), nil
+	case "ollama":
+		host := ollamaHost
+		if host == "" {
+			host = os.Getenv("OLLAMA_HOST")
+		}
+		return ollama.New(model, host), nil
+	default:
+		return nil, fmt.Errorf("unknown provider %q (want: claude | openai | ollama)", name)
+	}
 }

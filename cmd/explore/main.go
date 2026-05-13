@@ -86,7 +86,9 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
-	m := tui.NewModel(gen, tree)
+	prefetcher := index.NewPrefetcher(gen, 0) // 0 → default concurrency (3)
+	defer prefetcher.Close()
+	m := tui.NewModel(gen, tree, prefetcher)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fatal(err)

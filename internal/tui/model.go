@@ -59,9 +59,10 @@ func qaTabMode(tab int) string {
 
 // Model is the root Bubble Tea model.
 type Model struct {
-	gen   *index.Generator
-	tree  *Tree
-	stack *nav.Stack
+	gen        *index.Generator
+	tree       *Tree
+	stack      *nav.Stack
+	prefetcher *index.Prefetcher
 
 	width, height int
 
@@ -107,6 +108,10 @@ type Model struct {
 	pendingG bool
 
 	statusMsg string
+
+	// initialCmd is the load tick scheduled at construction time; returned
+	// from Init() so the first focused node gets explained on startup.
+	initialCmd tea.Cmd
 }
 
 // qaState holds Q&A UI state. The active mode is derived from m.expTab
@@ -155,10 +160,11 @@ func (q *qaState) streamVisible(mode string, id model.NodeID) bool {
 	return true
 }
 
-func NewModel(gen *index.Generator, tree *Tree) Model {
+func NewModel(gen *index.Generator, tree *Tree, prefetcher *index.Prefetcher) Model {
 	m := Model{
 		gen:         gen,
 		tree:        tree,
+		prefetcher:  prefetcher,
 		stack:       nav.New(),
 		activePane:  paneTree,
 		expCache:    make(map[model.NodeID]*model.Explanation),
@@ -172,11 +178,25 @@ func NewModel(gen *index.Generator, tree *Tree) Model {
 		m.cursor = 0
 		m.currentID = rows[0].ID
 		m.stack.Push(m.currentID)
+		// Kick off the first explanation + warm the neighborhood. The Cmd
+		// returned by scheduleLoad must be threaded through Init() so the
+		// debouncedLoadMsg actually fires.
+		m.initialCmd = m.scheduleLoad(m.currentID)
+		m.enqueuePrefetch(m.currentID)
 	}
 	return m
 }
 
-func (m Model) Init() tea.Cmd { return nil }
+func (m Model) Init() tea.Cmd {
+	var cmds []tea.Cmd
+	if m.initialCmd != nil {
+		cmds = append(cmds, m.initialCmd)
+	}
+	if m.prefetcher != nil {
+		cmds = append(cmds, listenPrefetch(m.prefetcher.Updates()))
+	}
+	return tea.Batch(cmds...)
+}
 
 // --- Messages ---
 
@@ -202,6 +222,22 @@ type qaTokenMsg struct {
 
 type qaStreamStarted struct {
 	ch <-chan llm.Token
+}
+
+type prefetchUpdateMsg struct {
+	update index.Update
+}
+
+type prefetchClosedMsg struct{}
+
+func listenPrefetch(ch <-chan index.Update) tea.Cmd {
+	return func() tea.Msg {
+		u, ok := <-ch
+		if !ok {
+			return prefetchClosedMsg{}
+		}
+		return prefetchUpdateMsg{update: u}
+	}
 }
 
 // --- Cache helpers ---
@@ -271,7 +307,53 @@ func (m *Model) syncCurrent() tea.Cmd {
 	m.currentID = newID
 	m.stack.Push(newID)
 	m.loadErr = nil
-	return m.scheduleLoad(newID)
+	cmd := m.scheduleLoad(newID)
+	m.enqueuePrefetch(newID)
+	return cmd
+}
+
+// enqueuePrefetch asks the prefetcher to warm explanations for nodes the user
+// is likely to visit next: the visible tree-row neighborhood around the
+// cursor, plus the parent file when focused on a symbol so going "up" is
+// instant. De-duplication and concurrency capping live in the prefetcher
+// itself, so we can call this freely on every focus change.
+func (m *Model) enqueuePrefetch(currentID model.NodeID) {
+	if m.prefetcher == nil {
+		return
+	}
+	const window = 5
+	rows := m.tree.Rows()
+	if len(rows) == 0 {
+		return
+	}
+	lo := m.cursor - window
+	if lo < 0 {
+		lo = 0
+	}
+	hi := m.cursor + window + 1
+	if hi > len(rows) {
+		hi = len(rows)
+	}
+	ids := make([]model.NodeID, 0, hi-lo+1)
+	for i := lo; i < hi; i++ {
+		id := rows[i].ID
+		if id == currentID {
+			continue
+		}
+		if _, cached := m.expCache[id]; cached {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	if currentID.Kind == model.KindSymbol && currentID.Path != "" {
+		parent := model.NodeID{Kind: model.KindFile, Path: currentID.Path}
+		if _, cached := m.expCache[parent]; !cached {
+			ids = append(ids, parent)
+		}
+	}
+	if len(ids) > 0 {
+		m.prefetcher.Enqueue(ids...)
+	}
 }
 
 // scheduleLoad cancels any in-flight load, bumps the generation, and — for
@@ -501,6 +583,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		ctx, cancel := context.WithCancel(context.Background())
 		m.loadCancel = cancel
 		return m, m.loadCmd(ctx, msg.id, msg.gen)
+
+	case prefetchUpdateMsg:
+		if msg.update.Err == nil && msg.update.Exp != nil {
+			m.expCache[msg.update.ID] = msg.update.Exp
+			debug.Logf("prefetchUpdateMsg: cached kind=%v path=%q sym=%q", msg.update.ID.Kind, msg.update.ID.Path, msg.update.ID.Symbol)
+			// If this happens to be the node we're currently looking at
+			// while waiting for a user-driven load, drop the spinner.
+			if msg.update.ID == m.currentID && m.loading {
+				m.loading = false
+				if m.loadCancel != nil {
+					m.loadCancel()
+					m.loadCancel = nil
+				}
+			}
+		} else if msg.update.Err != nil {
+			debug.Logf("prefetchUpdateMsg: err kind=%v path=%q err=%v", msg.update.ID.Kind, msg.update.ID.Path, msg.update.Err)
+		}
+		if m.prefetcher == nil {
+			return m, nil
+		}
+		return m, listenPrefetch(m.prefetcher.Updates())
+
+	case prefetchClosedMsg:
+		return m, nil
 
 	case qaStreamStarted:
 		debug.Logf("qaStreamStarted: ch=%v", msg.ch != nil)

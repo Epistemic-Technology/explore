@@ -186,7 +186,15 @@ type Metadata struct {
 - Python, TS, Rust support, fuzzy search overlay, regenerate (`r`), token budget UI, config file.
 
 **v0.4**
-- More languages, optional MCP server mode (expose explanations to other tools), shareable cache export.
+- More languages, shareable cache export.
+
+**v0.5**
+- `u` / `d` xref navigation (callers / callees, picker when >1), `e` open in `$EDITOR`, `y` yank (path / explanation / source), secret-scan warn before LLM calls (gitleaks-style, never auto-redact), symbol-level granularity for long (>200 LOC) functions.
+
+**v0.6 — git integration**
+- Commit history view for the focused node (repo / dir / file / symbol), scoped by `git log -- <path>` (symbol scope uses `git log -L` or line-range follow).
+- Diff view per commit (unified, syntax-highlighted via the existing `internal/highlight` pipeline).
+- LLM-generated explanations of *changes* in a commit: what changed, why (commit message + diff as context), and which symbols are affected. Cached by `sha256(commit_sha + diff + prompt_version + model_id)` so re-viewing is free.
 
 ## Open questions / proposed defaults
 

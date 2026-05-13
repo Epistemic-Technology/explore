@@ -9,9 +9,13 @@ Implemented in go / [Bubble Tea](https://github.com/charmbracelet/bubbletea).
   - **Claude** (default): `ANTHROPIC_API_KEY`
   - **OpenAI**: `OPENAI_API_KEY` plus `--provider openai`
   - **Ollama**: a local Ollama server (defaults to `http://localhost:11434`), `--provider ollama`
-- `gopls` on `PATH` for caller/callee lookups (optional; xref is disabled without it)
+- Language servers on `PATH` for caller/callee lookups (all optional; xref is disabled per-language when missing):
+  - Go: `gopls`
+  - Python: `pyright-langserver`
+  - TypeScript/TSX: `typescript-language-server`
+  - Rust: `rust-analyzer`
 
-v0.1 only parses Go source. Other languages still show the file tree but produce no symbol-level explanations.
+Symbol-level explanations are available for Go, Python, TypeScript (`.ts` / `.tsx`), and Rust. Other languages still show in the file tree but won't expand to a symbol list. The source pane uses tree-sitter highlight queries (Neovim-style) for inline syntax coloring on these languages; the focused row drops styling so the cursor highlight reads cleanly.
 
 ## Install
 

@@ -10,7 +10,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/charmbracelet/x/ansi"
+
 	"github.com/mikethicke/explore/internal/debug"
+	"github.com/mikethicke/explore/internal/highlight"
 	"github.com/mikethicke/explore/internal/index"
 	"github.com/mikethicke/explore/internal/llm"
 	"github.com/mikethicke/explore/internal/model"
@@ -114,6 +117,10 @@ type Model struct {
 	usageCh     chan llm.Usage
 	tokenBudget int
 
+	// Syntax highlighter; nil when query compilation failed (degrades to
+	// plain rendering, same as an unsupported language).
+	highlighter *highlight.Highlighter
+
 	// Vim-style count prefix (e.g. 5j) and pending "g" awaiting a second "g".
 	count    int
 	pendingG bool
@@ -172,6 +179,13 @@ func (q *qaState) streamVisible(mode string, id model.NodeID) bool {
 }
 
 func NewModel(gen *index.Generator, tree *Tree, prefetcher *index.Prefetcher, tokenBudget int) Model {
+	hl, err := highlight.New()
+	if err != nil {
+		// A query compile error here is a programmer bug, but we don't want
+		// to crash the TUI over a missing highlight. Degrade to plain text.
+		debug.Logf("NewModel: highlight init err=%v", err)
+		hl = nil
+	}
 	usageCh := make(chan llm.Usage, 64)
 	// Non-blocking send: the channel is sized for typical burstiness, but if
 	// it somehow saturates we'd rather undercount than stall an LLM call.
@@ -195,6 +209,7 @@ func NewModel(gen *index.Generator, tree *Tree, prefetcher *index.Prefetcher, to
 		},
 		usageCh:     usageCh,
 		tokenBudget: tokenBudget,
+		highlighter: hl,
 	}
 	if rows := tree.Rows(); len(rows) > 0 {
 		m.cursor = 0
@@ -1388,10 +1403,18 @@ func (m Model) renderSource(w, h int) string {
 	if h < 1 {
 		return ""
 	}
-	lines := strings.Split(strings.TrimRight(src, "\n"), "\n")
+	// Important: don't TrimRight before computing offsets — span byte offsets
+	// must align with the source the highlighter saw.
+	srcBytes := []byte(src)
+	lines, lineStarts := splitLinesWithOffsets(srcBytes)
 	total := len(lines)
 
-	// Clamp scroll to keep sourceLine visible.
+	lang := tsparse.DetectLanguage(m.currentFile)
+	var spans []highlight.Span
+	if m.highlighter != nil {
+		spans = m.highlighter.Highlight(context.Background(), srcBytes, lang)
+	}
+
 	scroll := m.srcScroll
 	if m.sourceLine-1 < scroll {
 		scroll = m.sourceLine - 1
@@ -1411,19 +1434,101 @@ func (m Model) renderSource(w, h int) string {
 	}
 
 	gutterW := len(fmt.Sprintf("%d", total))
+	contentW := w - gutterW - 1
+	if contentW < 1 {
+		contentW = 1
+	}
+	// spanIdx advances forward as we iterate lines, since spans are sorted
+	// by Start. Lets us skip the binary search per line.
+	spanIdx := 0
 	var b strings.Builder
 	for i := scroll; i < end; i++ {
-		ln := strings.ReplaceAll(lines[i], "\t", "    ")
-		num := fmt.Sprintf("%*d", gutterW, i+1)
-		content := truncate(ln, w-gutterW-1)
-		row := dimStyle.Render(num) + " " + content
-		if i+1 == m.sourceLine {
-			// Highlight whole row including the line number.
-			row = curLineStyle.Render(fmt.Sprintf("%s %s", num, padRight(content, w-gutterW-1)))
+		lineStart := lineStarts[i]
+		lineEnd := lineStart + len(lines[i])
+		// Advance spanIdx past anything that ends before this line begins.
+		for spanIdx < len(spans) && spans[spanIdx].End <= lineStart {
+			spanIdx++
 		}
-		b.WriteString(row + "\n")
+		num := fmt.Sprintf("%*d", gutterW, i+1)
+
+		var content string
+		if i+1 == m.sourceLine {
+			// Cursor row: drop syntax highlighting so curLineStyle's bg
+			// applies cleanly. Reader sees their position clearly; the
+			// surrounding rows still carry full color.
+			plain := strings.ReplaceAll(lines[i], "\t", "    ")
+			plain = truncate(plain, contentW)
+			content = curLineStyle.Render(fmt.Sprintf("%s %s", num, padRight(plain, contentW)))
+			b.WriteString(content + "\n")
+			continue
+		}
+
+		styled := renderLineSpans(lines[i], lineStart, lineEnd, spans, spanIdx)
+		// Tab-expand happens after styling so ANSI codes don't get tab'd.
+		styled = strings.ReplaceAll(styled, "\t", "    ")
+		styled = ansi.Truncate(styled, contentW, "")
+		b.WriteString(dimStyle.Render(num) + " " + styled + "\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// splitLinesWithOffsets returns the line texts (without trailing \n) and the
+// byte offset where each starts in src. Mirrors strings.Split on '\n' but
+// also gives back offsets for span lookup.
+func splitLinesWithOffsets(src []byte) ([]string, []int) {
+	var lines []string
+	var offsets []int
+	start := 0
+	for i := 0; i < len(src); i++ {
+		if src[i] == '\n' {
+			lines = append(lines, string(src[start:i]))
+			offsets = append(offsets, start)
+			start = i + 1
+		}
+	}
+	if start < len(src) {
+		lines = append(lines, string(src[start:]))
+		offsets = append(offsets, start)
+	} else if len(src) == 0 {
+		lines = append(lines, "")
+		offsets = append(offsets, 0)
+	}
+	return lines, offsets
+}
+
+// renderLineSpans builds a styled string for one line by walking spans that
+// overlap [lineStart, lineEnd). startIdx is the first potentially-overlapping
+// span; callers pass it forward so we don't binary-search every line.
+func renderLineSpans(line string, lineStart, lineEnd int, spans []highlight.Span, startIdx int) string {
+	var b strings.Builder
+	pos := lineStart
+	for k := startIdx; k < len(spans); k++ {
+		sp := spans[k]
+		if sp.Start >= lineEnd {
+			break
+		}
+		spStart := sp.Start
+		spEnd := sp.End
+		if spStart < lineStart {
+			spStart = lineStart
+		}
+		if spEnd > lineEnd {
+			spEnd = lineEnd
+		}
+		if spStart >= spEnd {
+			continue
+		}
+		if pos < spStart {
+			b.WriteString(line[pos-lineStart : spStart-lineStart])
+		}
+		style := styleFor(sp.Kind)
+		b.WriteString(style.Render(line[spStart-lineStart : spEnd-lineStart]))
+		pos = spEnd
+	}
+	if pos < lineEnd {
+		b.WriteString(line[pos-lineStart:])
+	}
+	return b.String()
 }
 
 func (m Model) renderQA(mode string, w, h int) string {

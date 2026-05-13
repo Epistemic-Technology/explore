@@ -65,8 +65,9 @@ type Client struct {
 
 // Start launches the given binary (e.g. "gopls") and performs the LSP
 // initialize handshake against rootDir. Returns an error if the binary is not
-// on PATH so callers can degrade gracefully.
-func Start(ctx context.Context, bin, rootDir string) (*Client, error) {
+// on PATH so callers can degrade gracefully. args are passed verbatim to the
+// server process (e.g. ["--stdio"] for pyright).
+func Start(ctx context.Context, bin, rootDir string, args ...string) (*Client, error) {
 	if _, err := exec.LookPath(bin); err != nil {
 		return nil, fmt.Errorf("%s not found on PATH: %w", bin, err)
 	}
@@ -74,7 +75,7 @@ func Start(ctx context.Context, bin, rootDir string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, bin)
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = absRoot
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

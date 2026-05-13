@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -77,4 +78,95 @@ func (c *Cache) Put(key []byte, e *model.Explanation) error {
 	return c.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucket).Put(key, data)
 	})
+}
+
+// ExportFormatVersion identifies the on-disk shape of exported JSON; bump if
+// the entry layout changes so importers can refuse incompatible files.
+const ExportFormatVersion = 1
+
+type exportFile struct {
+	FormatVersion int            `json:"format_version"`
+	Entries       []exportEntry  `json:"entries"`
+}
+
+type exportEntry struct {
+	// Key is the stringy composite produced by Key() — kept as-is so the file
+	// is grep-able and humans can spot which model / prompt-version an entry
+	// belongs to.
+	Key         string             `json:"key"`
+	Explanation *model.Explanation `json:"explanation"`
+}
+
+// Export writes every cache entry to w as a single JSON document. The output
+// is portable across machines because the cache key already encodes
+// source-hash + level + prompt-version + model — no host paths are involved.
+func (c *Cache) Export(w io.Writer) error {
+	out := exportFile{FormatVersion: ExportFormatVersion}
+	err := c.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucket)
+		return b.ForEach(func(k, v []byte) error {
+			var e model.Explanation
+			if err := json.Unmarshal(v, &e); err != nil {
+				// Skip rather than fail the whole export — a single bad row
+				// shouldn't block sharing the rest.
+				return nil
+			}
+			out.Entries = append(out.Entries, exportEntry{
+				Key:         string(k),
+				Explanation: &e,
+			})
+			return nil
+		})
+	})
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(out)
+}
+
+// ImportResult reports what changed during an import.
+type ImportResult struct {
+	Added   int
+	Skipped int // existing key, overwrite was false
+}
+
+// Import reads a JSON export written by Export and merges entries into this
+// cache. When overwrite is false, entries whose key already exists locally are
+// left untouched. Returns an error if the file isn't a recognized export or
+// the format version doesn't match.
+func (c *Cache) Import(r io.Reader, overwrite bool) (ImportResult, error) {
+	var in exportFile
+	dec := json.NewDecoder(r)
+	if err := dec.Decode(&in); err != nil {
+		return ImportResult{}, fmt.Errorf("decode export: %w", err)
+	}
+	if in.FormatVersion != ExportFormatVersion {
+		return ImportResult{}, fmt.Errorf("unsupported export format version %d (want %d)", in.FormatVersion, ExportFormatVersion)
+	}
+	var res ImportResult
+	err := c.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucket)
+		for _, e := range in.Entries {
+			if e.Explanation == nil {
+				continue
+			}
+			key := []byte(e.Key)
+			if !overwrite && b.Get(key) != nil {
+				res.Skipped++
+				continue
+			}
+			data, err := json.Marshal(e.Explanation)
+			if err != nil {
+				return err
+			}
+			if err := b.Put(key, data); err != nil {
+				return err
+			}
+			res.Added++
+		}
+		return nil
+	})
+	return res, err
 }

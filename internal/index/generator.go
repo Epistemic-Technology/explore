@@ -24,7 +24,7 @@ type Generator struct {
 	Root       string
 	Cache      *cache.Cache
 	Provider   llm.Provider
-	LSP        *lsp.Client // may be nil
+	LSP        *lsp.Pool   // may be nil; per-language clients spawned lazily
 	RepoPrimer string      // README + AGENTS.md, computed once
 
 	// OnUsage is invoked after every successful Provider.Explain call (cache
@@ -58,7 +58,7 @@ func shouldRegenerate(ctx context.Context) bool {
 	return v
 }
 
-func NewGenerator(root string, c *cache.Cache, p llm.Provider, l *lsp.Client) *Generator {
+func NewGenerator(root string, c *cache.Cache, p llm.Provider, l *lsp.Pool) *Generator {
 	g := &Generator{Root: root, Cache: c, Provider: p, LSP: l}
 	g.RepoPrimer = loadRepoPrimer(root)
 	return g
@@ -220,21 +220,34 @@ func (g *Generator) SymbolSource(ctx context.Context, relPath, symbolName string
 	return string(tsparse.SymbolSource(src, sym)), nil
 }
 
-// lookupCallers queries gopls for references to the symbol's name position.
+// lookupCallers queries the language server for references to the symbol's
+// name position. Picks the right server for the file's language via the pool;
+// returns nil (silently) if no server is available for that language.
 func (g *Generator) lookupCallers(ctx context.Context, absPath string, sym model.Symbol) []model.SymbolRef {
 	if g.LSP == nil {
+		return nil
+	}
+	lang := tsparse.DetectLanguage(absPath)
+	langID := lang.LSPLanguageID()
+	if langID == "" {
+		return nil
+	}
+	// The pool keys by tsparse language string, not the LSP language id (they
+	// agree for go/python/rust but tsparse uses "tsx" while LSP uses "typescriptreact").
+	client, err := g.LSP.ClientFor(ctx, string(lang))
+	if err != nil || client == nil {
 		return nil
 	}
 	src, err := os.ReadFile(absPath)
 	if err != nil {
 		return nil
 	}
-	if err := g.LSP.EnsureOpen(ctx, absPath, "go", src); err != nil {
+	if err := client.EnsureOpen(ctx, absPath, langID, src); err != nil {
 		return nil
 	}
 	line := sym.StartLine - 1
 	col := findNameColumn(src, sym)
-	locs, err := g.LSP.References(ctx, absPath, line, col, false)
+	locs, err := client.References(ctx, absPath, line, col, false)
 	if err != nil {
 		return nil
 	}

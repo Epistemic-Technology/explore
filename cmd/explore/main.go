@@ -2,7 +2,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -23,6 +22,19 @@ import (
 )
 
 func main() {
+	// Subcommand dispatch: these are one-shot operations that exit before the
+	// TUI flag set is parsed. Anything else falls through to the normal path.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "export-cache":
+			runExportCache(os.Args[2:])
+			return
+		case "import-cache":
+			runImportCache(os.Args[2:])
+			return
+		}
+	}
+
 	// CLI flags default to "" / 0 so an unset flag means "use config or
 	// built-in default", not "override with the zero value".
 	cacheDir := flag.String("cache-dir", "", "override cache directory (default: <repo>/.explore)")
@@ -108,20 +120,13 @@ func main() {
 	}
 	debug.Logf("startup: provider=%s model=%q root=%q tokenBudget=%d", provider.Name(), provider.Model(), absRoot, cfg.UI.TokenBudget)
 
-	var lspClient *lsp.Client
+	var lspPool *lsp.Pool
 	if !cfg.UI.NoLSP {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		lspClient, err = lsp.Start(ctx, "gopls", absRoot)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "gopls unavailable, xref disabled: %v\n", err)
-			lspClient = nil
-		} else {
-			defer lspClient.Close()
-		}
+		lspPool = lsp.NewPool(absRoot, nil)
+		defer lspPool.Close()
 	}
 
-	gen := index.NewGenerator(absRoot, c, provider, lspClient)
+	gen := index.NewGenerator(absRoot, c, provider, lspPool)
 	tree, err := tui.NewTree(absRoot)
 	if err != nil {
 		fatal(err)
@@ -151,6 +156,94 @@ func loadConfig(path string) (config.Config, error) {
 		path = p
 	}
 	return config.Load(path)
+}
+
+// runExportCache implements `explore export-cache <out.json> [repo-path]`.
+// It opens the repo's cache, dumps all entries to the given path, and exits.
+func runExportCache(args []string) {
+	fs := flag.NewFlagSet("export-cache", flag.ExitOnError)
+	cacheDir := fs.String("cache-dir", "", "override cache directory (default: <repo>/.explore)")
+	fs.Parse(args)
+	if fs.NArg() < 1 {
+		fatal(fmt.Errorf("usage: explore export-cache <out.json> [repo-path]"))
+	}
+	outPath := fs.Arg(0)
+	root := "."
+	if fs.NArg() > 1 {
+		root = fs.Arg(1)
+	}
+	cachePath, err := resolveCachePath(root, *cacheDir)
+	if err != nil {
+		fatal(err)
+	}
+	c, err := cache.Open(cachePath)
+	if err != nil {
+		fatal(err)
+	}
+	defer c.Close()
+
+	f, err := os.Create(outPath)
+	if err != nil {
+		fatal(err)
+	}
+	defer f.Close()
+	if err := c.Export(f); err != nil {
+		fatal(err)
+	}
+	fmt.Fprintf(os.Stderr, "exported cache to %s\n", outPath)
+}
+
+// runImportCache implements `explore import-cache <in.json> [repo-path]`.
+// By default, existing local entries are preserved; --overwrite replaces them.
+func runImportCache(args []string) {
+	fs := flag.NewFlagSet("import-cache", flag.ExitOnError)
+	cacheDir := fs.String("cache-dir", "", "override cache directory (default: <repo>/.explore)")
+	overwrite := fs.Bool("overwrite", false, "replace existing local entries instead of skipping them")
+	fs.Parse(args)
+	if fs.NArg() < 1 {
+		fatal(fmt.Errorf("usage: explore import-cache <in.json> [repo-path]"))
+	}
+	inPath := fs.Arg(0)
+	root := "."
+	if fs.NArg() > 1 {
+		root = fs.Arg(1)
+	}
+	cachePath, err := resolveCachePath(root, *cacheDir)
+	if err != nil {
+		fatal(err)
+	}
+	c, err := cache.Open(cachePath)
+	if err != nil {
+		fatal(err)
+	}
+	defer c.Close()
+
+	f, err := os.Open(inPath)
+	if err != nil {
+		fatal(err)
+	}
+	defer f.Close()
+	res, err := c.Import(f, *overwrite)
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Fprintf(os.Stderr, "imported %d entries (skipped %d existing)\n", res.Added, res.Skipped)
+}
+
+// resolveCachePath mirrors the path logic in main() so subcommands and the
+// TUI agree on where cache.db lives.
+func resolveCachePath(root, cacheDirOverride string) (string, error) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	if st, err := os.Stat(absRoot); err != nil || !st.IsDir() {
+		return "", fmt.Errorf("not a directory: %s", absRoot)
+	}
+	if cacheDirOverride == "" {
+		return filepath.Join(absRoot, ".explore", "cache.db"), nil
+	}
+	return filepath.Join(cacheDirOverride, "cache.db"), nil
 }
 
 // buildProvider picks an llm.Provider from the resolved config. Missing API

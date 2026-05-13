@@ -222,3 +222,76 @@ func (t *Tree) FindRow(id model.NodeID) int {
 	}
 	return -1
 }
+
+// Reveal expands the ancestors of id so its row becomes visible. Returns the
+// new row index. Loads children lazily along the way, including parsing the
+// containing file for a symbol target. -1 if the target cannot be located
+// (e.g. the file was deleted on disk since indexing).
+func (t *Tree) Reveal(ctx context.Context, id model.NodeID) int {
+	if id.Kind == model.KindRepo {
+		t.rebuildRows()
+		return t.FindRow(id)
+	}
+	// Build the chain of ancestor directories from the root down to id.
+	parts := splitPath(id.Path)
+	cur := t.nodes[0] // repo root
+	cur.expanded = true
+	for i := range parts {
+		dirPath := strings.Join(parts[:i+1], string(filepath.Separator))
+		// Reaching the final part: it's either a file (when id.Kind is File or
+		// Symbol) or the dir itself (when id.Kind is Dir).
+		isLast := i == len(parts)-1
+		wantKind := model.KindDir
+		if isLast && (id.Kind == model.KindFile || id.Kind == model.KindSymbol) {
+			wantKind = model.KindFile
+		}
+		child := findChildByID(cur, model.NodeID{Kind: wantKind, Path: dirPath})
+		if child == nil {
+			if !cur.loaded {
+				if err := t.loadChildren(cur); err != nil {
+					return -1
+				}
+			}
+			child = findChildByID(cur, model.NodeID{Kind: wantKind, Path: dirPath})
+		}
+		if child == nil {
+			return -1
+		}
+		cur = child
+		// Expand intermediate dirs; the final file node only needs expansion
+		// when the target is a symbol inside it.
+		if !isLast || id.Kind == model.KindSymbol {
+			if !cur.loaded {
+				if err := t.loadChildren(cur); err != nil {
+					return -1
+				}
+			}
+			cur.expanded = true
+		}
+	}
+	t.rebuildRows()
+	return t.FindRow(id)
+}
+
+func splitPath(p string) []string {
+	if p == "" {
+		return nil
+	}
+	parts := strings.Split(p, string(filepath.Separator))
+	out := parts[:0]
+	for _, s := range parts {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func findChildByID(n *treeNode, id model.NodeID) *treeNode {
+	for _, c := range n.children {
+		if c.id == id {
+			return c
+		}
+	}
+	return nil
+}

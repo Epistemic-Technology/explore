@@ -59,7 +59,8 @@ Navigation is vim-ish. A few essentials:
 - `[` / `]` — cycle tabs within the explanation pane
 - `b` or `ctrl+o` — back in the nav stack; `ctrl+i` — forward
 - `?` — open the Q&A tab (questions are scoped to the focused node)
-- `r` — regenerate the current explanation (clears the in-memory copy)
+- `/` — fuzzy search files and Go symbols; ↑/↓ to pick, Enter to jump, Esc to close
+- `r` — regenerate the current explanation (bypasses both the in-memory and on-disk caches)
 - `q` or `ctrl+c` — quit
 
 ## License

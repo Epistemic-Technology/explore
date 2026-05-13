@@ -103,6 +103,9 @@ type Model struct {
 	qa     qaState
 	expTab int
 
+	// Search overlay state; populated lazily on first `/`.
+	search searchUI
+
 	// Vim-style count prefix (e.g. 5j) and pending "g" awaiting a second "g".
 	count    int
 	pendingG bool
@@ -208,10 +211,12 @@ type explanationMsg struct {
 }
 
 // debouncedLoadMsg fires after loadDebounce has elapsed since a navigation
-// move. If gen has been superseded by a newer move, it's dropped.
+// move. If gen has been superseded by a newer move, it's dropped. regen marks
+// a user-driven `r` reload — the BBolt cache is bypassed.
 type debouncedLoadMsg struct {
-	id  model.NodeID
-	gen int
+	id    model.NodeID
+	gen   int
+	regen bool
 }
 
 type qaTokenMsg struct {
@@ -361,6 +366,12 @@ func (m *Model) enqueuePrefetch(currentID model.NodeID) {
 // actually dispatch the LLM call. Always bumping the generation invalidates
 // any pending tick from a previous schedule.
 func (m *Model) scheduleLoad(id model.NodeID) tea.Cmd {
+	return m.scheduleLoadOpts(id, false)
+}
+
+// scheduleLoadOpts is scheduleLoad with the regenerate flag exposed. Used by
+// the `r` keybinding; everywhere else calls scheduleLoad with regen=false.
+func (m *Model) scheduleLoadOpts(id model.NodeID, regen bool) tea.Cmd {
 	if m.loadCancel != nil {
 		m.loadCancel()
 		m.loadCancel = nil
@@ -374,20 +385,22 @@ func (m *Model) scheduleLoad(id model.NodeID) tea.Cmd {
 		debug.Logf("scheduleLoad: skip kind=%v path=%q sym=%q (not loadable)", id.Kind, id.Path, id.Symbol)
 		return nil
 	}
-	if _, ok := m.expCache[id]; ok {
+	// Regenerate must dispatch even on an in-memory cache hit — that's the
+	// whole point of the keypress.
+	if _, ok := m.expCache[id]; ok && !regen {
 		m.loading = false
 		debug.Logf("scheduleLoad: cache hit kind=%v path=%q sym=%q", id.Kind, id.Path, id.Symbol)
 		return nil
 	}
 	m.loading = true
 	gen := m.loadGen
-	debug.Logf("scheduleLoad: dispatching tick gen=%d kind=%v path=%q sym=%q", gen, id.Kind, id.Path, id.Symbol)
+	debug.Logf("scheduleLoad: dispatching tick gen=%d kind=%v path=%q sym=%q regen=%v", gen, id.Kind, id.Path, id.Symbol, regen)
 	return tea.Tick(loadDebounce, func(time.Time) tea.Msg {
-		return debouncedLoadMsg{id: id, gen: gen}
+		return debouncedLoadMsg{id: id, gen: gen, regen: regen}
 	})
 }
 
-func (m Model) loadCmd(ctx context.Context, id model.NodeID, loadGen int) tea.Cmd {
+func (m Model) loadCmd(ctx context.Context, id model.NodeID, loadGen int, regen bool) tea.Cmd {
 	indexGen := m.gen
 	parentSummary := ""
 	if id.Kind == model.KindSymbol {
@@ -395,8 +408,11 @@ func (m Model) loadCmd(ctx context.Context, id model.NodeID, loadGen int) tea.Cm
 			parentSummary = pe.Prose
 		}
 	}
+	if regen {
+		ctx = index.WithRegenerate(ctx)
+	}
 	return func() tea.Msg {
-		debug.Logf("loadCmd: invoking provider kind=%v path=%q sym=%q gen=%d", id.Kind, id.Path, id.Symbol, loadGen)
+		debug.Logf("loadCmd: invoking provider kind=%v path=%q sym=%q gen=%d regen=%v", id.Kind, id.Path, id.Symbol, loadGen, regen)
 		switch id.Kind {
 		case model.KindFile:
 			exp, err := indexGen.ExplainFile(ctx, id.Path)
@@ -579,10 +595,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			debug.Logf("debouncedLoadMsg: dropping stale tick gen=%d cur=%d match=%v", msg.gen, m.loadGen, msg.id == m.currentID)
 			return m, nil
 		}
-		debug.Logf("debouncedLoadMsg: firing gen=%d kind=%v path=%q sym=%q", msg.gen, msg.id.Kind, msg.id.Path, msg.id.Symbol)
+		debug.Logf("debouncedLoadMsg: firing gen=%d kind=%v path=%q sym=%q regen=%v", msg.gen, msg.id.Kind, msg.id.Path, msg.id.Symbol, msg.regen)
 		ctx, cancel := context.WithCancel(context.Background())
 		m.loadCancel = cancel
-		return m, m.loadCmd(ctx, msg.id, msg.gen)
+		return m, m.loadCmd(ctx, msg.id, msg.gen, msg.regen)
 
 	case prefetchUpdateMsg:
 		if msg.update.Err == nil && msg.update.Exp != nil {
@@ -636,7 +652,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.qa.stream += msg.text
 		return m, listenQA(m.qa.streamCh)
 
+	case searchIndexedMsg:
+		m.search.indexing = false
+		m.search.index = msg.index
+		m.search.indexErr = msg.err
+		m.refreshSearch()
+		return m, nil
+
 	case tea.KeyMsg:
+		// Search overlay swallows all input (except via its own exit keys) so
+		// typed letters don't fire vim bindings while the user is filtering.
+		if m.search.open {
+			return m.updateSearch(msg)
+		}
 		// These bindings must work even when the Q&A input is collecting
 		// keystrokes — otherwise you'd be trapped in the input with no way
 		// to switch panes or tabs. Trade-off: literal '[' / ']' can't be
@@ -721,10 +749,14 @@ func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.resetVim()
 		return m, nil
+	case "/":
+		m.resetVim()
+		cmd := m.openSearch()
+		return m, cmd
 	case "r":
 		m.resetVim()
 		delete(m.expCache, m.currentID)
-		return m, m.scheduleLoad(m.currentID)
+		return m, m.scheduleLoadOpts(m.currentID, true)
 	}
 
 	// Pane-specific keys.
@@ -1155,7 +1187,33 @@ func (m Model) View() string {
 	center := lipgloss.JoinVertical(lipgloss.Left, expBox, srcBox)
 
 	row := lipgloss.JoinHorizontal(lipgloss.Top, treeBox, center)
-	return lipgloss.JoinVertical(lipgloss.Left, row, m.renderStatus())
+	base := lipgloss.JoinVertical(lipgloss.Left, row, m.renderStatus())
+	if m.search.open {
+		w, h := searchOverlayDims(m.width, m.height)
+		overlay := m.renderSearch(w-2, h-2) // -2 for the rounded border
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, overlay, lipgloss.WithWhitespaceChars(" "))
+	}
+	return base
+}
+
+// searchOverlayDims caps the overlay at sensible defaults but shrinks to fit
+// small terminals.
+func searchOverlayDims(termW, termH int) (int, int) {
+	w := searchOverlayW
+	if w > termW-4 {
+		w = termW - 4
+	}
+	if w < 30 {
+		w = 30
+	}
+	h := searchOverlayH
+	if h > termH-2 {
+		h = termH - 2
+	}
+	if h < 8 {
+		h = 8
+	}
+	return w, h
 }
 
 func (m Model) boxPane(num, activeTab int, body string, w, h int) string {

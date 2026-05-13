@@ -34,11 +34,13 @@ func (g *Generator) ExplainDir(ctx context.Context, relPath string) (*model.Expl
 	}
 	hash := cache.HashSource([]byte(view))
 	key := cache.Key(hash, "dir", g.Provider.Model(), cache.PromptVersion)
-	if hit, _ := g.Cache.Get(key); hit != nil {
-		debug.Logf("ExplainDir: cache hit path=%q", relPath)
-		return hit, nil
+	if !shouldRegenerate(ctx) {
+		if hit, _ := g.Cache.Get(key); hit != nil {
+			debug.Logf("ExplainDir: cache hit path=%q", relPath)
+			return hit, nil
+		}
 	}
-	debug.Logf("ExplainDir: cache miss path=%q viewLen=%d", relPath, len(view))
+	debug.Logf("ExplainDir: cache miss path=%q viewLen=%d regen=%v", relPath, len(view), shouldRegenerate(ctx))
 
 	llmExp, err := g.Provider.Explain(ctx, llm.ExplainRequest{
 		Level:      llm.LevelDir,
@@ -75,11 +77,13 @@ func (g *Generator) ExplainRepo(ctx context.Context) (*model.Explanation, error)
 	}
 	hash := cache.HashSource([]byte(view))
 	key := cache.Key(hash, "repo", g.Provider.Model(), cache.PromptVersion)
-	if hit, _ := g.Cache.Get(key); hit != nil {
-		debug.Logf("ExplainRepo: cache hit")
-		return hit, nil
+	if !shouldRegenerate(ctx) {
+		if hit, _ := g.Cache.Get(key); hit != nil {
+			debug.Logf("ExplainRepo: cache hit")
+			return hit, nil
+		}
 	}
-	debug.Logf("ExplainRepo: cache miss viewLen=%d", len(view))
+	debug.Logf("ExplainRepo: cache miss viewLen=%d regen=%v", len(view), shouldRegenerate(ctx))
 
 	llmExp, err := g.Provider.Explain(ctx, llm.ExplainRequest{
 		Level:      llm.LevelRepo,

@@ -28,6 +28,22 @@ type Generator struct {
 	RepoPrimer string      // README + AGENTS.md, computed once
 }
 
+// regenCtxKey is unexported so callers must go through WithRegenerate.
+type regenCtxKey struct{}
+
+// WithRegenerate marks ctx so that the next top-level ExplainX call skips the
+// BBolt cache and overwrites whatever was there. Internal sub-lookups
+// (e.g. fileBlurb pulling child summaries when building a dir view) are
+// unaffected — only the entry-point node is regenerated.
+func WithRegenerate(ctx context.Context) context.Context {
+	return context.WithValue(ctx, regenCtxKey{}, true)
+}
+
+func shouldRegenerate(ctx context.Context) bool {
+	v, _ := ctx.Value(regenCtxKey{}).(bool)
+	return v
+}
+
 func NewGenerator(root string, c *cache.Cache, p llm.Provider, l *lsp.Client) *Generator {
 	g := &Generator{Root: root, Cache: c, Provider: p, LSP: l}
 	g.RepoPrimer = loadRepoPrimer(root)
@@ -71,11 +87,13 @@ func (g *Generator) ExplainFile(ctx context.Context, relPath string) (*model.Exp
 	}
 	hash := cache.HashSource(src)
 	key := cache.Key(hash, "file", g.Provider.Model(), cache.PromptVersion)
-	if hit, _ := g.Cache.Get(key); hit != nil {
-		debug.Logf("ExplainFile: cache hit path=%q", relPath)
-		return hit, nil
+	if !shouldRegenerate(ctx) {
+		if hit, _ := g.Cache.Get(key); hit != nil {
+			debug.Logf("ExplainFile: cache hit path=%q", relPath)
+			return hit, nil
+		}
 	}
-	debug.Logf("ExplainFile: cache miss path=%q srcLen=%d", relPath, len(src))
+	debug.Logf("ExplainFile: cache miss path=%q srcLen=%d regen=%v", relPath, len(src), shouldRegenerate(ctx))
 
 	pf, err := tsparse.Parse(ctx, absPath, src)
 	if err != nil {
@@ -129,11 +147,13 @@ func (g *Generator) ExplainSymbol(ctx context.Context, relPath, symbolName, file
 	source := string(tsparse.SymbolSource(src, sym))
 	hash := cache.HashSource([]byte(source))
 	key := cache.Key(hash, "symbol", g.Provider.Model(), cache.PromptVersion)
-	if hit, _ := g.Cache.Get(key); hit != nil {
-		debug.Logf("ExplainSymbol: cache hit path=%q sym=%q", relPath, symbolName)
-		return hit, nil
+	if !shouldRegenerate(ctx) {
+		if hit, _ := g.Cache.Get(key); hit != nil {
+			debug.Logf("ExplainSymbol: cache hit path=%q sym=%q", relPath, symbolName)
+			return hit, nil
+		}
 	}
-	debug.Logf("ExplainSymbol: cache miss path=%q sym=%q sourceLen=%d", relPath, symbolName, len(source))
+	debug.Logf("ExplainSymbol: cache miss path=%q sym=%q sourceLen=%d regen=%v", relPath, symbolName, len(source), shouldRegenerate(ctx))
 
 	callers := g.lookupCallers(ctx, absPath, sym)
 

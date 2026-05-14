@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -20,6 +21,46 @@ import (
 	"github.com/mikethicke/explore/internal/lsp"
 	"github.com/mikethicke/explore/internal/tui"
 )
+
+// reorderArgs returns args with every flag token moved ahead of every
+// positional arg. The standard `flag` package stops parsing at the first
+// positional, which trips users who type `explore <path> --debug` expecting
+// getopt-style permissive parsing. Boolean flags are detected via fs.Lookup
+// so we know when *not* to consume the next token as the flag's value.
+// `--` ends flag processing, POSIX-style — everything after stays positional.
+func reorderArgs(args []string, fs *flag.FlagSet) []string {
+	var flags, positionals []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			positionals = append(positionals, args[i+1:]...)
+			break
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			positionals = append(positionals, a)
+			continue
+		}
+		flags = append(flags, a)
+		if strings.Contains(a, "=") {
+			continue // self-contained: --flag=value
+		}
+		name := strings.TrimLeft(a, "-")
+		f := fs.Lookup(name)
+		if f == nil {
+			// Unknown flag — leave to fs.Parse to error on; assume bool so we
+			// don't accidentally eat a positional.
+			continue
+		}
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			continue
+		}
+		if i+1 < len(args) {
+			i++
+			flags = append(flags, args[i])
+		}
+	}
+	return append(flags, positionals...)
+}
 
 func main() {
 	// Subcommand dispatch: these are one-shot operations that exit before the
@@ -46,6 +87,9 @@ func main() {
 	noLSP := flag.Bool("no-lsp", false, "disable gopls integration")
 	debugFlag := flag.Bool("debug", false, "write debug log to <cache-dir>/debug.log")
 	tokenBudget := flag.Int("token-budget", -1, "session token budget; 0 = track only, -1 = use config default")
+	// Move flags ahead of positionals so `explore <path> --debug` works the
+	// same as `explore --debug <path>` — see reorderArgs.
+	os.Args = append([]string{os.Args[0]}, reorderArgs(os.Args[1:], flag.CommandLine)...)
 	flag.Parse()
 
 	root := "."
@@ -127,6 +171,7 @@ func main() {
 	}
 
 	gen := index.NewGenerator(absRoot, c, provider, lspPool)
+	gen.LongFunctionThreshold = cfg.UI.LongFunctionThreshold
 	tree, err := tui.NewTree(absRoot)
 	if err != nil {
 		fatal(err)
@@ -163,7 +208,7 @@ func loadConfig(path string) (config.Config, error) {
 func runExportCache(args []string) {
 	fs := flag.NewFlagSet("export-cache", flag.ExitOnError)
 	cacheDir := fs.String("cache-dir", "", "override cache directory (default: <repo>/.explore)")
-	fs.Parse(args)
+	fs.Parse(reorderArgs(args, fs))
 	if fs.NArg() < 1 {
 		fatal(fmt.Errorf("usage: explore export-cache <out.json> [repo-path]"))
 	}
@@ -199,7 +244,7 @@ func runImportCache(args []string) {
 	fs := flag.NewFlagSet("import-cache", flag.ExitOnError)
 	cacheDir := fs.String("cache-dir", "", "override cache directory (default: <repo>/.explore)")
 	overwrite := fs.Bool("overwrite", false, "replace existing local entries instead of skipping them")
-	fs.Parse(args)
+	fs.Parse(reorderArgs(args, fs))
 	if fs.NArg() < 1 {
 		fatal(fmt.Errorf("usage: explore import-cache <in.json> [repo-path]"))
 	}

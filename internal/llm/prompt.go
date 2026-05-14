@@ -54,6 +54,9 @@ func BuildExplainUser(req ExplainRequest) string {
 	b.WriteString("\nSource:\n```\n")
 	b.WriteString(req.Source)
 	b.WriteString("\n```\n")
+	if req.IsLong {
+		b.WriteString("\nThis symbol is unusually long. In `prose`, replace the standard 3-6 sentence summary with a numbered outline of the function's inner sections (e.g., \"1. Setup: …\", \"2. Main loop: …\", \"3. Cleanup: …\"), each one short and grounded in identifiers from the source. The metadata fields stay unchanged.")
+	}
 	b.WriteString("\nReturn only the JSON object described in the system prompt.")
 	return b.String()
 }

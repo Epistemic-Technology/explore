@@ -42,6 +42,11 @@ type ExplainRequest struct {
 	// RepoPrimer is the repo-level priming text (README + CLAUDE.md/AGENTS.md if present).
 	// Stable across requests, ideal for caching.
 	RepoPrimer string
+
+	// IsLong marks the symbol as one whose line count exceeds the configured
+	// long-function threshold. BuildExplainUser appends a structural-outline
+	// instruction when this is set; providers themselves don't need to peek.
+	IsLong bool
 }
 
 type Explanation struct {

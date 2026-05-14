@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/aymanbagabas/go-osc52/v2"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -18,6 +22,7 @@ import (
 	"github.com/mikethicke/explore/internal/llm"
 	"github.com/mikethicke/explore/internal/model"
 	"github.com/mikethicke/explore/internal/nav"
+	"github.com/mikethicke/explore/internal/secrets"
 	"github.com/mikethicke/explore/internal/tsparse"
 )
 
@@ -109,6 +114,9 @@ type Model struct {
 	// Search overlay state; populated lazily on first `/`.
 	search searchUI
 
+	// xref picker overlay state for `u` / `d` (callers / callees).
+	xref xrefUI
+
 	// Running token totals across the session. Updated when the Generator
 	// reports usage via the usageCh (Explain calls, including prefetcher) and
 	// when QA streams emit a final usage token. tokenBudget is the configured
@@ -117,6 +125,11 @@ type Model struct {
 	usageCh     chan llm.Usage
 	tokenBudget int
 
+	// secretsCh carries warnings from the Generator's OnSecrets callback (and
+	// the Q&A scan) so they can surface in the status bar without blocking.
+	// Sized for typical burstiness; on saturation we drop rather than stall.
+	secretsCh chan []secrets.Finding
+
 	// Syntax highlighter; nil when query compilation failed (degrades to
 	// plain rendering, same as an unsupported language).
 	highlighter *highlight.Highlighter
@@ -124,6 +137,10 @@ type Model struct {
 	// Vim-style count prefix (e.g. 5j) and pending "g" awaiting a second "g".
 	count    int
 	pendingG bool
+
+	// pendingY = true means the user just hit `y` and we're waiting for the
+	// sub-key (p/e/s). Cleared on any non-yank key per vim convention.
+	pendingY bool
 
 	statusMsg string
 
@@ -195,6 +212,13 @@ func NewModel(gen *index.Generator, tree *Tree, prefetcher *index.Prefetcher, to
 		default:
 		}
 	}
+	secretsCh := make(chan []secrets.Finding, 16)
+	gen.OnSecrets = func(f []secrets.Finding) {
+		select {
+		case secretsCh <- f:
+		default:
+		}
+	}
 	m := Model{
 		gen:         gen,
 		tree:        tree,
@@ -208,6 +232,7 @@ func NewModel(gen *index.Generator, tree *Tree, prefetcher *index.Prefetcher, to
 			nodeThreads: make(map[model.NodeID][]llm.Turn),
 		},
 		usageCh:     usageCh,
+		secretsCh:   secretsCh,
 		tokenBudget: tokenBudget,
 		highlighter: hl,
 	}
@@ -231,6 +256,9 @@ func (m Model) Init() tea.Cmd {
 	}
 	if m.usageCh != nil {
 		cmds = append(cmds, listenUsage(m.usageCh))
+	}
+	if m.secretsCh != nil {
+		cmds = append(cmds, listenSecrets(m.secretsCh))
 	}
 	if m.prefetcher != nil {
 		cmds = append(cmds, listenPrefetch(m.prefetcher.Updates()))
@@ -300,6 +328,23 @@ func listenUsage(ch <-chan llm.Usage) tea.Cmd {
 			return nil
 		}
 		return usageMsg{u: u}
+	}
+}
+
+// secretsMsg carries findings from a content scan; the TUI handler renders a
+// status-bar warning and re-arms the listener.
+type secretsMsg struct{ findings []secrets.Finding }
+
+func listenSecrets(ch <-chan []secrets.Finding) tea.Cmd {
+	if ch == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		f, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return secretsMsg{findings: f}
 	}
 }
 
@@ -720,6 +765,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshSearch()
 		return m, nil
 
+	case editorFinishedMsg:
+		if msg.err != nil {
+			m.statusMsg = "editor: " + msg.err.Error()
+		}
+		return m, nil
+
+	case callersResultMsg:
+		return m.handleCallersResultMsg(msg)
+
+	case calleesOnLineMsg:
+		return m.handleCalleesOnLineMsg(msg)
+
+	case secretsMsg:
+		if len(msg.findings) > 0 {
+			m.statusMsg = warnStyle.Render("⚠ ") + "secrets: " + secrets.Summary(msg.findings)
+		}
+		return m, listenSecrets(m.secretsCh)
+
 	case usageMsg:
 		m.usage = m.usage.Add(msg.u)
 		debug.Logf("usageMsg: total in=%d out=%d", m.usage.InputTokens, m.usage.OutputTokens)
@@ -730,6 +793,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// typed letters don't fire vim bindings while the user is filtering.
 		if m.search.open {
 			return m.updateSearch(msg)
+		}
+		if m.xref.open {
+			return m.updateXref(msg)
 		}
 		// These bindings must work even when the Q&A input is collecting
 		// keystrokes — otherwise you'd be trapped in the input with no way
@@ -823,6 +889,37 @@ func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.resetVim()
 		delete(m.expCache, m.currentID)
 		return m, m.scheduleLoadOpts(m.currentID, true)
+	case "e":
+		m.resetVim()
+		return m.openEditor()
+	case "u":
+		m.resetVim()
+		return m.openCallersOf()
+	case "d":
+		m.resetVim()
+		return m.openCalleesOnLine()
+	case "y":
+		// Start a yank: next key chooses what to copy. Status bar will
+		// prompt the user; resetVim hasn't cleared anything yet.
+		m.count = 0
+		m.pendingG = false
+		m.pendingY = true
+		m.statusMsg = "yank: [p]ath  [e]xplanation  [s]ource"
+		return m, nil
+	}
+
+	if m.pendingY {
+		m.pendingY = false
+		switch s {
+		case "p":
+			return m.yankPath()
+		case "e":
+			return m.yankExplanation()
+		case "s":
+			return m.yankSource()
+		}
+		// Any other key cancels the pending yank — vim convention.
+		m.statusMsg = ""
 	}
 
 	// Pane-specific keys.
@@ -838,6 +935,138 @@ func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// xrefEntries returns Metadata.Callers (when up=true) or Metadata.Callees for
+// the currently focused node, or nil if the explanation hasn't loaded yet.
+// The Generator populates these via the LSP pool during explanation
+// generation; if LSP is unavailable they'll just be empty.
+func (m Model) xrefEntries(up bool) []model.SymbolRef {
+	exp, ok := m.expCache[m.currentID]
+	if !ok || exp == nil {
+		return nil
+	}
+	if up {
+		return exp.Metadata.Callers
+	}
+	return exp.Metadata.Callees
+}
+
+// yankToClipboard writes text to the host terminal's clipboard via OSC 52,
+// which is the only mechanism that works uniformly across local terminals
+// and SSH. Returns a short label describing what was copied, for the status
+// bar. An empty payload short-circuits with an error message.
+func (m Model) yankToClipboard(text, kind string) string {
+	if text == "" {
+		return "yank " + kind + ": nothing to copy"
+	}
+	seq := osc52.New(text)
+	// Stderr is typically unbuffered and untouched by app stdout redirection;
+	// OSC 52 is an escape interpreted by the terminal emulator regardless of
+	// whether we're in alt-screen mode, so this is safe to write mid-TUI.
+	_, _ = seq.WriteTo(os.Stderr)
+	preview := text
+	if len(preview) > 40 {
+		preview = preview[:40] + "…"
+	}
+	preview = strings.ReplaceAll(preview, "\n", " ⏎ ")
+	return "yanked " + kind + ": " + preview
+}
+
+func (m Model) yankPath() (tea.Model, tea.Cmd) {
+	path := m.currentID.String()
+	m.statusMsg = m.yankToClipboard(path, "path")
+	return m, nil
+}
+
+func (m Model) yankExplanation() (tea.Model, tea.Cmd) {
+	exp, ok := m.expCache[m.currentID]
+	if !ok || exp == nil {
+		m.statusMsg = "yank explanation: not loaded yet"
+		return m, nil
+	}
+	m.statusMsg = m.yankToClipboard(exp.Prose, "explanation")
+	return m, nil
+}
+
+func (m Model) yankSource() (tea.Model, tea.Cmd) {
+	if m.currentFile == "" {
+		m.statusMsg = "yank source: no file selected"
+		return m, nil
+	}
+	src, ok := m.sourceCache[m.currentFile]
+	if !ok {
+		m.statusMsg = "yank source: source not loaded"
+		return m, nil
+	}
+	// Symbol focus: cut to the symbol's byte range using the parsed file.
+	if m.currentID.Kind == model.KindSymbol {
+		if pf, ok := m.parsedCache[m.currentFile]; ok {
+			for _, s := range pf.Symbols {
+				if s.Name == m.currentID.Symbol && s.StartByte < s.EndByte && s.EndByte <= len(src) {
+					m.statusMsg = m.yankToClipboard(src[s.StartByte:s.EndByte], "source")
+					return m, nil
+				}
+			}
+		}
+	}
+	m.statusMsg = m.yankToClipboard(src, "source")
+	return m, nil
+}
+
+// editorFinishedMsg is sent back after $EDITOR exits so we can surface any
+// launch error in the status bar without re-rendering mid-suspend.
+type editorFinishedMsg struct{ err error }
+
+// openEditor suspends the TUI and launches $EDITOR on the current file. When
+// a specific line is focused (symbol or cursor in the source pane) it passes
+// `+LINE` before the filename — the convention vim/nvim/nano/emacs all
+// understand. $EDITOR is split on whitespace so users can set
+// `EDITOR="nvim -p"` and have flags forwarded.
+func (m Model) openEditor() (tea.Model, tea.Cmd) {
+	if m.currentFile == "" {
+		m.statusMsg = "no file selected"
+		return m, nil
+	}
+	editor := strings.TrimSpace(os.Getenv("EDITOR"))
+	if editor == "" {
+		m.statusMsg = "$EDITOR is not set"
+		return m, nil
+	}
+	parts := strings.Fields(editor)
+	args := parts[1:]
+	if line := m.editorLine(); line > 0 {
+		args = append(args, fmt.Sprintf("+%d", line))
+	}
+	args = append(args, filepath.Join(m.gen.Root, m.currentFile))
+	c := exec.Command(parts[0], args...)
+	return m, tea.ExecProcess(c, func(err error) tea.Msg {
+		return editorFinishedMsg{err: err}
+	})
+}
+
+// editorLine returns the 1-based line to jump to when launching $EDITOR, or 0
+// if there's nothing better than the start of file. Preference order:
+//   - the user's current cursor line in the source pane (sourceLine)
+//   - the focused symbol's start line (when sourceLine is 0, e.g., user hasn't
+//     entered the source pane yet)
+func (m Model) editorLine() int {
+	if m.sourceLine > 0 {
+		return m.sourceLine
+	}
+	if m.currentID.Kind == model.KindSymbol {
+		if s, ok := m.containingSymbol(m.currentFile, 1); ok && s.Name == m.currentID.Symbol {
+			return s.StartLine
+		}
+		if pf, ok := m.parsedCache[m.currentFile]; ok {
+			for _, s := range pf.Symbols {
+				if s.Name == m.currentID.Symbol {
+					return s.StartLine
+				}
+			}
+		}
+	}
+	return 0
+}
+
 // takeCount returns the pending vim count (or def if none) and clears it.
 func (m *Model) takeCount(def int) int {
 	n := def
@@ -851,6 +1080,7 @@ func (m *Model) takeCount(def int) int {
 func (m *Model) resetVim() {
 	m.count = 0
 	m.pendingG = false
+	m.pendingY = false
 }
 
 // cycleTab rotates the active tab of the focused pane by delta. Panes with a
@@ -1134,6 +1364,7 @@ func (m Model) askCmd(ctx context.Context, id model.NodeID, mode string, q strin
 
 	debug.Logf("askCmd: mode=%s kind=%v path=%q sym=%q histLen=%d qLen=%d", mode, id.Kind, id.Path, id.Symbol, len(history), len(q))
 
+	secretsCh := m.secretsCh
 	return func() tea.Msg {
 		var source string
 		switch id.Kind {
@@ -1147,6 +1378,16 @@ func (m Model) askCmd(ctx context.Context, id model.NodeID, mode string, q strin
 		case model.KindSymbol:
 			s, _ := gen.SymbolSource(ctx, id.Path, id.Symbol)
 			source = s
+		}
+		// Scan the source before it leaves with the question. Same channel
+		// the Generator uses, so the status-bar warning path is shared.
+		if secretsCh != nil && source != "" {
+			if f := secrets.Scan([]byte(source)); len(f) > 0 {
+				select {
+				case secretsCh <- f:
+				default:
+				}
+			}
 		}
 
 		var req llm.AskRequest
@@ -1262,6 +1503,11 @@ func (m Model) View() string {
 	if m.search.open {
 		w, h := searchOverlayDims(m.width, m.height)
 		overlay := m.renderSearch(w-2, h-2) // -2 for the rounded border
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, overlay, lipgloss.WithWhitespaceChars(" "))
+	}
+	if m.xref.open {
+		w, h := xrefOverlayDims(m.width, m.height)
+		overlay := m.renderXref(w-2, h-2)
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, overlay, lipgloss.WithWhitespaceChars(" "))
 	}
 	return base
@@ -1574,7 +1820,7 @@ func (m Model) renderStatus() string {
 		} else if m.pendingG {
 			paneKeys = "(g) " + paneKeys
 		}
-		keys = paneKeys + dimStyle.Render("  •  [Alt+1-3/Tab] pane  [ [ / ] ] tab  [b] back  [?] ask  [r] regen  [q] quit")
+		keys = paneKeys + dimStyle.Render("  •  [Alt+1-3/Tab] pane  [ [ / ] ] tab  [b] back  [u/d] callers/callees  [?] ask  [r] regen  [e] edit  [y] yank  [q] quit")
 	}
 	return keys + "  " + m.renderUsage() + m.statusMsg
 }

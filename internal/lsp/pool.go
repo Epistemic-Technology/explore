@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
+
+	"github.com/mikethicke/explore/internal/debug"
 )
 
 // ServerConfig describes how to spawn a language server for a given language
@@ -66,6 +69,11 @@ func NewPool(rootDir string, configs []ServerConfig) *Pool {
 // first request. Returns (nil, nil) if no config is registered for the
 // language or if a previous start attempt failed — callers degrade gracefully
 // the same way they do for a missing single client.
+//
+// If a previously-started client has since died (the server process crashed
+// or got killed), it's evicted and a fresh one is launched in its place. This
+// keeps `u`/`d` working across the rest of a session instead of producing
+// permanent broken-pipe failures.
 func (p *Pool) ClientFor(ctx context.Context, language string) (*Client, error) {
 	if p == nil || language == "" {
 		return nil, nil
@@ -76,8 +84,16 @@ func (p *Pool) ClientFor(ctx context.Context, language string) (*Client, error) 
 		return nil, errors.New("lsp: pool closed")
 	}
 	if c, ok := p.clients[language]; ok {
-		p.mu.Unlock()
-		return c, nil
+		if c.IsAlive() {
+			p.mu.Unlock()
+			return c, nil
+		}
+		// Cached client is dead — evict and fall through to (re)start. Close
+		// the corpse outside the lock so we don't serialize on a process
+		// kill.
+		debug.Logf("lsp.pool: evicting dead client for %s", language)
+		delete(p.clients, language)
+		go c.Close()
 	}
 	if p.unavailable[language] {
 		p.mu.Unlock()
@@ -93,7 +109,10 @@ func (p *Pool) ClientFor(ctx context.Context, language string) (*Client, error) 
 
 	// Spawn outside the lock — process startup + initialize handshake can
 	// take hundreds of ms; holding the mutex would serialize all callers.
+	start := time.Now()
+	debug.Logf("lsp.pool: starting %s for %s", cfg.Bin, language)
 	c, err := Start(ctx, cfg.Bin, p.root, cfg.Args...)
+	debug.Logf("lsp.pool: start %s for %s done after=%s err=%v", cfg.Bin, language, time.Since(start), err)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err != nil {

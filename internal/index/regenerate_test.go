@@ -9,6 +9,7 @@ import (
 
 	"github.com/mikethicke/explore/internal/cache"
 	"github.com/mikethicke/explore/internal/llm"
+	"github.com/mikethicke/explore/internal/secrets"
 )
 
 // countingProvider implements llm.Provider for counting Explain invocations.
@@ -154,5 +155,61 @@ func TestOnUsage_FiresOnMissNotOnHit(t *testing.T) {
 	}
 	if got := total.Total(); got != 300 {
 		t.Fatalf("after regen: total = %d, want 300", got)
+	}
+}
+
+func TestOnSecrets_FiresOnExplainFileWithLeakedToken(t *testing.T) {
+	root := t.TempDir()
+	// File contents include a fake AWS key. The view-builder includes file
+	// source verbatim for small files, so this exercises the live scan path.
+	src := "package x\n\nconst Tok = \"AKIAIOSFODNN7EXAMPLE\"\n"
+	if err := writeFile(filepath.Join(root, "x.go"), src); err != nil {
+		t.Fatal(err)
+	}
+	c, err := cache.Open(filepath.Join(root, ".explore", "cache.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	p := &countingProvider{}
+	g := NewGenerator(root, c, p, nil)
+
+	var seen [][]secrets.Finding
+	g.OnSecrets = func(f []secrets.Finding) { seen = append(seen, f) }
+
+	if _, err := g.ExplainFile(context.Background(), "x.go"); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 1 {
+		t.Fatalf("OnSecrets calls = %d, want 1", len(seen))
+	}
+	if len(seen[0]) != 1 || seen[0][0].Kind != "aws-access-key" {
+		t.Errorf("findings = %+v, want one aws-access-key", seen[0])
+	}
+}
+
+func TestOnSecrets_DoesNotFireOnCleanFile(t *testing.T) {
+	root := t.TempDir()
+	if err := writeFile(filepath.Join(root, "x.go"), "package x\n\nfunc A() {}\n"); err != nil {
+		t.Fatal(err)
+	}
+	c, err := cache.Open(filepath.Join(root, ".explore", "cache.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	p := &countingProvider{}
+	g := NewGenerator(root, c, p, nil)
+
+	called := false
+	g.OnSecrets = func(f []secrets.Finding) { called = true }
+
+	if _, err := g.ExplainFile(context.Background(), "x.go"); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Errorf("OnSecrets fired on clean file")
 	}
 }

@@ -17,6 +17,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/mikethicke/explore/internal/debug"
 )
 
 type rpcRequest struct {
@@ -61,12 +64,28 @@ type Client struct {
 	opened   map[string]bool
 
 	closed atomic.Bool
+
+	// deadMu protects dead. dead is set the first time we detect the server
+	// is gone — either readLoop exits (EOF/pipe broken) or writeMessage
+	// fails. Subsequent call() invocations short-circuit instead of hammering
+	// a closed pipe. The Pool checks IsAlive and restarts when needed.
+	deadMu sync.Mutex
+	dead   error
 }
 
 // Start launches the given binary (e.g. "gopls") and performs the LSP
 // initialize handshake against rootDir. Returns an error if the binary is not
 // on PATH so callers can degrade gracefully. args are passed verbatim to the
 // server process (e.g. ["--stdio"] for pyright).
+//
+// The ctx parameter governs the initialize handshake only — NOT the process
+// lifetime. We deliberately use exec.Command instead of exec.CommandContext
+// here: the latter SIGKILLs the process when ctx is canceled, and callers
+// almost always pass a request-scoped context with `defer cancel()`. That
+// turned each successful xref lookup into a "spawn gopls → use it once →
+// kill it on return" cycle (EOF on stdout, broken pipe on the next call).
+// Process lifetime is owned by Client.Close, which Pool calls on shutdown
+// or eviction.
 func Start(ctx context.Context, bin, rootDir string, args ...string) (*Client, error) {
 	if _, err := exec.LookPath(bin); err != nil {
 		return nil, fmt.Errorf("%s not found on PATH: %w", bin, err)
@@ -75,7 +94,7 @@ func Start(ctx context.Context, bin, rootDir string, args ...string) (*Client, e
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := exec.Command(bin, args...)
 	cmd.Dir = absRoot
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -85,11 +104,18 @@ func Start(ctx context.Context, bin, rootDir string, args ...string) (*Client, e
 	if err != nil {
 		return nil, err
 	}
-	// Discard stderr to avoid blocking on a full pipe; users debug with EXPLORE_LSP_LOG.
-	cmd.Stderr = io.Discard
+	// Capture stderr line-by-line into the debug log. Without this, when gopls
+	// crashes or panics, the cause is invisible — and crashes do happen
+	// (mid-session deaths leave the pipe broken). We drain continuously so
+	// the OS buffer never fills (which would block the server's writes).
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	go drainStderr(bin, stderr)
 
 	c := &Client{
 		cmd:     cmd,
@@ -121,9 +147,45 @@ func (c *Client) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	_ = c.notify("exit", nil)
-	_ = c.stdin.Close()
-	return c.cmd.Process.Kill()
+	if c.stdin != nil {
+		_ = c.notify("exit", nil)
+		_ = c.stdin.Close()
+	}
+	if c.cmd != nil && c.cmd.Process != nil {
+		return c.cmd.Process.Kill()
+	}
+	return nil
+}
+
+// markDead records the first failure that proved the server is gone. Idempotent:
+// subsequent calls (e.g. read error followed by write error) keep the first
+// reason, which is more diagnostic.
+func (c *Client) markDead(reason error) {
+	c.deadMu.Lock()
+	defer c.deadMu.Unlock()
+	if c.dead == nil {
+		c.dead = reason
+		debug.Logf("lsp.client: marked dead reason=%v", reason)
+	}
+}
+
+// IsAlive returns true while the server is responsive. Pool uses this to
+// decide whether to evict a stale client and start a fresh one.
+func (c *Client) IsAlive() bool {
+	if c == nil {
+		return false
+	}
+	c.deadMu.Lock()
+	defer c.deadMu.Unlock()
+	return c.dead == nil
+}
+
+// deadErr returns the death reason or nil. Used inside call() to fail-fast
+// instead of writing into a closed pipe and producing 50 broken-pipe lines.
+func (c *Client) deadErr() error {
+	c.deadMu.Lock()
+	defer c.deadMu.Unlock()
+	return c.dead
 }
 
 func (c *Client) nextID() int { return int(c.idCounter.Add(1)) }
@@ -135,13 +197,22 @@ func (c *Client) writeMessage(payload any) error {
 	}
 	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(body))
 	if _, err := c.stdin.Write([]byte(header)); err != nil {
+		c.markDead(err)
 		return err
 	}
-	_, err = c.stdin.Write(body)
-	return err
+	if _, err := c.stdin.Write(body); err != nil {
+		c.markDead(err)
+		return err
+	}
+	return nil
 }
 
 func (c *Client) call(ctx context.Context, method string, params any, out any) error {
+	if err := c.deadErr(); err != nil {
+		// Fail fast: skip the write attempt entirely so we don't generate a
+		// new broken-pipe log line for every request after the server died.
+		return fmt.Errorf("lsp server unavailable: %w", err)
+	}
 	id := c.nextID()
 	ch := make(chan rpcResponse, 1)
 	c.pendingMu.Lock()
@@ -153,16 +224,22 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) e
 		c.pendingMu.Unlock()
 	}()
 
+	start := time.Now()
+	debug.Logf("lsp.call: send method=%s id=%d", method, id)
 	if err := c.writeMessage(rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params}); err != nil {
+		debug.Logf("lsp.call: write err method=%s id=%d err=%v", method, id, err)
 		return err
 	}
 	select {
 	case <-ctx.Done():
+		debug.Logf("lsp.call: ctx done method=%s id=%d after=%s err=%v", method, id, time.Since(start), ctx.Err())
 		return ctx.Err()
 	case resp := <-ch:
 		if resp.Error != nil {
+			debug.Logf("lsp.call: rpc err method=%s id=%d after=%s err=%v", method, id, time.Since(start), resp.Error)
 			return resp.Error
 		}
+		debug.Logf("lsp.call: ok method=%s id=%d after=%s resultLen=%d", method, id, time.Since(start), len(resp.Result))
 		if out == nil || len(resp.Result) == 0 {
 			return nil
 		}
@@ -178,6 +255,11 @@ func (c *Client) readLoop() {
 	for {
 		msg, err := readMessage(c.stdout)
 		if err != nil {
+			// readMessage returns io.EOF when the server's stdout closes
+			// (usually because the process exited). Mark dead so subsequent
+			// call()s fail-fast and waiters get released.
+			c.markDead(fmt.Errorf("server stdout closed: %w", err))
+			c.releasePending(err)
 			return
 		}
 		var resp rpcResponse
@@ -193,6 +275,40 @@ func (c *Client) readLoop() {
 		c.pendingMu.Unlock()
 		if ok {
 			ch <- resp
+		}
+	}
+}
+
+// drainStderr scans the language server's stderr line-by-line into the debug
+// log. Lines are tagged with the binary name so multiple servers (gopls,
+// pyright, clangd, …) are distinguishable. The bufio.Scanner default buffer
+// is 64KB; gopls panic stack traces can exceed that, so we bump to 1MB and
+// log a marker if anything still goes over.
+func drainStderr(bin string, r io.ReadCloser) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for scanner.Scan() {
+		debug.Logf("lsp.stderr[%s]: %s", bin, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		debug.Logf("lsp.stderr[%s]: scan err=%v", bin, err)
+	}
+}
+
+// releasePending pushes a synthetic error response to every pending caller
+// so they don't block forever waiting on ctx.Done(). Called once when the
+// read loop exits.
+func (c *Client) releasePending(reason error) {
+	c.pendingMu.Lock()
+	chans := make([]chan rpcResponse, 0, len(c.pending))
+	for _, ch := range c.pending {
+		chans = append(chans, ch)
+	}
+	c.pendingMu.Unlock()
+	for _, ch := range chans {
+		select {
+		case ch <- rpcResponse{Error: &rpcError{Code: -32099, Message: "server exited: " + reason.Error()}}:
+		default:
 		}
 	}
 }

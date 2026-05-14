@@ -42,6 +42,7 @@ func (g *Generator) ExplainDir(ctx context.Context, relPath string) (*model.Expl
 	}
 	debug.Logf("ExplainDir: cache miss path=%q viewLen=%d regen=%v", relPath, len(view), shouldRegenerate(ctx))
 
+	g.reportSecrets(view)
 	llmExp, err := g.Provider.Explain(ctx, llm.ExplainRequest{
 		Level:      llm.LevelDir,
 		Path:       relPath,
@@ -86,6 +87,7 @@ func (g *Generator) ExplainRepo(ctx context.Context) (*model.Explanation, error)
 	}
 	debug.Logf("ExplainRepo: cache miss viewLen=%d regen=%v", len(view), shouldRegenerate(ctx))
 
+	g.reportSecrets(view)
 	llmExp, err := g.Provider.Explain(ctx, llm.ExplainRequest{
 		Level:      llm.LevelRepo,
 		Path:       "",

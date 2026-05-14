@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/mikethicke/explore/internal/llm"
 	"github.com/mikethicke/explore/internal/lsp"
 	"github.com/mikethicke/explore/internal/model"
+	"github.com/mikethicke/explore/internal/secrets"
 	"github.com/mikethicke/explore/internal/tsparse"
 )
 
@@ -32,6 +34,17 @@ type Generator struct {
 	// goroutines (the prefetcher runs in parallel), so implementations must
 	// be safe for concurrent use. Optional.
 	OnUsage func(llm.Usage)
+
+	// OnSecrets is invoked when secrets.Scan flags content being sent to the
+	// LLM. The policy is warn-only — Generator never aborts on findings; the
+	// caller (TUI) decides what to surface. Called from the same goroutines
+	// that issue requests, including the prefetcher. Optional.
+	OnSecrets func([]secrets.Finding)
+
+	// LongFunctionThreshold is the line count above which ExplainSymbol marks
+	// a function/method request as long (req.IsLong=true), prompting the LLM
+	// for a structural outline. 0 disables the feature.
+	LongFunctionThreshold int
 }
 
 // reportUsage is a nil-safe helper to invoke OnUsage. Kept private so the
@@ -40,6 +53,33 @@ func (g *Generator) reportUsage(u llm.Usage) {
 	if g.OnUsage != nil && u.Total() > 0 {
 		g.OnUsage(u)
 	}
+}
+
+// reportSecrets scans payload for known credential patterns and fires
+// OnSecrets if anything matches. Called immediately before each
+// Provider.Explain so the warning fires for content actually being sent —
+// matches against the post-view/truncation payload, not the on-disk file.
+func (g *Generator) reportSecrets(payload string) {
+	if g.OnSecrets == nil || payload == "" {
+		return
+	}
+	if f := secrets.Scan([]byte(payload)); len(f) > 0 {
+		g.OnSecrets(f)
+	}
+}
+
+// isLongSymbol reports whether sym's line count exceeds the configured
+// long-function threshold. Returns false when the threshold is 0 (disabled)
+// or when sym is not a function/method.
+func (g *Generator) isLongSymbol(sym model.Symbol) bool {
+	if g.LongFunctionThreshold <= 0 {
+		return false
+	}
+	if sym.Kind != model.SymFunc && sym.Kind != model.SymMethod {
+		return false
+	}
+	loc := sym.EndLine - sym.StartLine + 1
+	return loc > g.LongFunctionThreshold
 }
 
 // regenCtxKey is unexported so callers must go through WithRegenerate.
@@ -122,6 +162,7 @@ func (g *Generator) ExplainFile(ctx context.Context, relPath string) (*model.Exp
 		Imports:    pf.Imports,
 		RepoPrimer: g.RepoPrimer,
 	}
+	g.reportSecrets(view)
 	llmExp, err := g.Provider.Explain(ctx, req)
 	if err != nil {
 		return nil, err
@@ -171,6 +212,7 @@ func (g *Generator) ExplainSymbol(ctx context.Context, relPath, symbolName, file
 	debug.Logf("ExplainSymbol: cache miss path=%q sym=%q sourceLen=%d regen=%v", relPath, symbolName, len(source), shouldRegenerate(ctx))
 
 	callers := g.lookupCallers(ctx, absPath, sym)
+	callees := g.lookupCallees(ctx, absPath, src, sym)
 
 	req := llm.ExplainRequest{
 		Level:         llm.LevelSymbol,
@@ -180,9 +222,12 @@ func (g *Generator) ExplainSymbol(ctx context.Context, relPath, symbolName, file
 		Source:        source,
 		Imports:       pf.Imports,
 		Callers:       refsToStrings(callers),
+		Callees:       refsToStrings(callees),
 		ParentSummary: fileSummary,
 		RepoPrimer:    g.RepoPrimer,
+		IsLong:        g.isLongSymbol(sym),
 	}
+	g.reportSecrets(source)
 	llmExp, err := g.Provider.Explain(ctx, req)
 	if err != nil {
 		return nil, err
@@ -194,6 +239,7 @@ func (g *Generator) ExplainSymbol(ctx context.Context, relPath, symbolName, file
 		Metadata: model.Metadata{
 			Imports:  llmExp.Metadata.Imports,
 			Callers:  callers,
+			Callees:  callees,
 			KeyTypes: llmExp.Metadata.KeyTypes,
 			Gotchas:  llmExp.Metadata.Gotchas,
 			LOC:      sym.EndLine - sym.StartLine + 1,
@@ -251,6 +297,9 @@ func (g *Generator) lookupCallers(ctx context.Context, absPath string, sym model
 	if err != nil {
 		return nil
 	}
+	// Cache per-file parses so we don't re-parse the same file once per
+	// reference inside it. Common case: many calls from the same caller.
+	parseCache := make(map[string]*tsparse.ParsedFile)
 	out := make([]model.SymbolRef, 0, len(locs))
 	for _, loc := range locs {
 		p := lsp.URIToPath(loc.URI)
@@ -258,11 +307,212 @@ func (g *Generator) lookupCallers(ctx context.Context, absPath string, sym model
 		if err != nil {
 			rel = p
 		}
+		line := loc.Range.Start.Line + 1
+		// Resolve the symbol that *contains* the call site. The LSP reference
+		// only tells us file+line of the call expression; the function the
+		// user wants to navigate to is whichever top-level symbol that line
+		// falls inside. Empty when the reference is at file scope (var init,
+		// etc.) — picker then jumps to the file, not a specific symbol.
+		callerName := g.containingSymbolName(ctx, p, line, parseCache)
 		out = append(out, model.SymbolRef{
-			Name: sym.Name,
+			Name: callerName,
 			Path: rel,
-			Line: loc.Range.Start.Line + 1,
+			Line: line,
 		})
+	}
+	return out
+}
+
+// containingSymbolName parses absPath (memoized in cache) and returns the
+// name of the innermost top-level symbol that contains the given 1-based
+// line, or "" if no symbol covers it. The Generator-side analog of the TUI's
+// containingSymbol — kept here so the lookup is colocated with the LSP
+// reference-resolution code that needs it.
+func (g *Generator) containingSymbolName(ctx context.Context, absPath string, line int, cache map[string]*tsparse.ParsedFile) string {
+	pf, ok := cache[absPath]
+	if !ok {
+		src, err := os.ReadFile(absPath)
+		if err != nil {
+			cache[absPath] = nil
+			return ""
+		}
+		parsed, err := tsparse.Parse(ctx, absPath, src)
+		if err != nil {
+			cache[absPath] = nil
+			return ""
+		}
+		pf = parsed
+		cache[absPath] = pf
+	}
+	if pf == nil {
+		return ""
+	}
+	// Innermost wins — for overlapping symbols (e.g. a method declared inside
+	// a class with chunked children), pick the smallest range that covers the line.
+	bestName := ""
+	bestSpan := 1 << 30
+	for _, s := range pf.Symbols {
+		if line < s.StartLine || line > s.EndLine {
+			continue
+		}
+		span := s.EndLine - s.StartLine
+		if span < bestSpan {
+			bestSpan = span
+			bestName = s.Name
+		}
+	}
+	return bestName
+}
+
+// lookupCallees finds call expressions inside the symbol's body via
+// tree-sitter, then asks the language server to resolve each call's
+// definition. Returns one SymbolRef per unique destination. Degrades silently
+// when LSP is unavailable, just like lookupCallers.
+func (g *Generator) lookupCallees(ctx context.Context, absPath string, src []byte, sym model.Symbol) []model.SymbolRef {
+	sites, err := tsparse.FindCallSites(ctx, absPath, src, sym.StartByte, sym.EndByte)
+	if err != nil || len(sites) == 0 {
+		return nil
+	}
+	return g.resolveCallSites(ctx, absPath, src, sites, sym.StartLine)
+}
+
+// LineCallsResult reports both what tree-sitter saw and what LSP resolved on
+// a given line. The UI uses SitesFound > 0 && len(Refs) == 0 to distinguish
+// "no calls on this line" from "calls exist but LSP couldn't resolve them"
+// (gopls missing, mid-indexing, etc.).
+type LineCallsResult struct {
+	Refs       []model.SymbolRef
+	SitesFound int // call expressions tree-sitter found on the line
+}
+
+// CallersResult mirrors LineCallsResult for `u`: SymbolFound lets the UI
+// distinguish "symbol not in this file" (tree-sitter didn't see it — likely
+// a stale focus or a deleted symbol) from "no callers" (LSP returned empty,
+// which usually means the server is unavailable or still indexing).
+type CallersResult struct {
+	Refs        []model.SymbolRef
+	SymbolFound bool
+}
+
+// CallersOf resolves a symbol in relPath via tsparse, then asks LSP for its
+// callers. Computed on demand (the TUI calls this from the `u` keybind) so
+// the picker doesn't depend on a cached explanation. Returns an empty result
+// without error when the file can't be parsed; the UI treats that as
+// "nothing to show" rather than surfacing a panic-worthy error mid-keypress.
+func (g *Generator) CallersOf(ctx context.Context, relPath, symbolName string) (CallersResult, error) {
+	start := time.Now()
+	debug.Logf("CallersOf: start path=%q sym=%q", relPath, symbolName)
+	absPath := filepath.Join(g.Root, relPath)
+	src, err := os.ReadFile(absPath)
+	if err != nil {
+		debug.Logf("CallersOf: read err path=%q err=%v", relPath, err)
+		return CallersResult{}, err
+	}
+	pf, err := tsparse.Parse(ctx, absPath, src)
+	if err != nil {
+		debug.Logf("CallersOf: parse err path=%q err=%v", relPath, err)
+		return CallersResult{}, err
+	}
+	sym, ok := findSymbol(pf, symbolName)
+	if !ok {
+		debug.Logf("CallersOf: symbol not found path=%q sym=%q", relPath, symbolName)
+		return CallersResult{}, nil
+	}
+	refs := g.lookupCallers(ctx, absPath, sym)
+	debug.Logf("CallersOf: done path=%q sym=%q refs=%d after=%s", relPath, symbolName, len(refs), time.Since(start))
+	return CallersResult{SymbolFound: true, Refs: refs}, nil
+}
+
+// CallsOnLine returns every destination reachable from a call expression that
+// starts on `line` (1-based) in relPath. A single line with multiple calls
+// (`foo(bar())`) yields one SymbolRef per call; a single call to an interface
+// method may yield multiple definitions (one per implementation) — all are
+// surfaced. Used by `d` xref-down: line-scoped, computed on demand.
+func (g *Generator) CallsOnLine(ctx context.Context, relPath string, line int) (LineCallsResult, error) {
+	start := time.Now()
+	debug.Logf("CallsOnLine: start path=%q line=%d", relPath, line)
+	if line < 1 {
+		return LineCallsResult{}, nil
+	}
+	absPath := filepath.Join(g.Root, relPath)
+	src, err := os.ReadFile(absPath)
+	if err != nil {
+		debug.Logf("CallsOnLine: read err path=%q err=%v", relPath, err)
+		return LineCallsResult{}, err
+	}
+	all, err := tsparse.FindCallSites(ctx, absPath, src, 0, len(src))
+	if err != nil {
+		debug.Logf("CallsOnLine: FindCallSites err path=%q err=%v", relPath, err)
+		return LineCallsResult{}, err
+	}
+	// FindCallSites returns 0-based lines; input is 1-based.
+	target := line - 1
+	var sites []tsparse.CallSite
+	for _, s := range all {
+		if s.Line == target {
+			sites = append(sites, s)
+		}
+	}
+	result := LineCallsResult{SitesFound: len(sites)}
+	if len(sites) == 0 {
+		debug.Logf("CallsOnLine: done path=%q line=%d sites=0 after=%s", relPath, line, time.Since(start))
+		return result, nil
+	}
+	result.Refs = g.resolveCallSites(ctx, absPath, src, sites, 0)
+	debug.Logf("CallsOnLine: done path=%q line=%d sites=%d refs=%d after=%s", relPath, line, len(sites), len(result.Refs), time.Since(start))
+	return result, nil
+}
+
+// resolveCallSites turns a set of CallSites into SymbolRefs by asking LSP
+// textDocument/definition for each. When excludeSelfStart > 0, definitions
+// pointing back at that 1-based line in the same file are filtered (used by
+// lookupCallees to skip a function's recursive call to itself). All locations
+// returned by LSP are kept — interface-method calls naturally produce one ref
+// per implementation, which is what the picker should show.
+func (g *Generator) resolveCallSites(ctx context.Context, absPath string, src []byte, sites []tsparse.CallSite, excludeSelfStart int) []model.SymbolRef {
+	if g.LSP == nil || len(sites) == 0 {
+		return nil
+	}
+	lang := tsparse.DetectLanguage(absPath)
+	langID := lang.LSPLanguageID()
+	if langID == "" {
+		return nil
+	}
+	client, err := g.LSP.ClientFor(ctx, string(lang))
+	if err != nil || client == nil {
+		return nil
+	}
+	if err := client.EnsureOpen(ctx, absPath, langID, src); err != nil {
+		return nil
+	}
+	relSelf := strings.TrimPrefix(absPath, g.Root+string(filepath.Separator))
+	seen := make(map[string]struct{})
+	var out []model.SymbolRef
+	for _, site := range sites {
+		locs, err := client.Definition(ctx, absPath, site.Line, site.Column)
+		if err != nil || len(locs) == 0 {
+			continue
+		}
+		for _, loc := range locs {
+			p := lsp.URIToPath(loc.URI)
+			rel, err := filepath.Rel(g.Root, p)
+			if err != nil {
+				rel = p
+			}
+			if excludeSelfStart > 0 && rel == relSelf && loc.Range.Start.Line+1 == excludeSelfStart {
+				continue
+			}
+			key := rel + ":" + site.Name + ":" + strconv.Itoa(loc.Range.Start.Line)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, model.SymbolRef{
+				Name: site.Name,
+				Path: rel,
+				Line: loc.Range.Start.Line + 1,
+			})
+		}
 	}
 	return out
 }

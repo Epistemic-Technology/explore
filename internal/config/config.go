@@ -56,6 +56,11 @@ type OllamaConfig struct {
 type UISection struct {
 	TokenBudget int  `toml:"token_budget"`
 	NoLSP       bool `toml:"no_lsp"`
+
+	// LongFunctionThreshold is the line count above which a function's
+	// explanation prompt asks the LLM for a structural outline instead of a
+	// 3-6 sentence summary. 0 disables the feature.
+	LongFunctionThreshold int `toml:"long_function_threshold"`
 }
 
 // Default returns the built-in configuration — what you'd get with no
@@ -77,6 +82,9 @@ func Default() Config {
 				Model: "qwen2.5-coder:14b",
 				Host:  "http://localhost:11434",
 			},
+		},
+		UI: UISection{
+			LongFunctionThreshold: 200,
 		},
 	}
 }

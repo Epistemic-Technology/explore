@@ -144,6 +144,10 @@ type Model struct {
 
 	statusMsg string
 
+	// helpOpen toggles the keyboard-shortcut overlay. While open it swallows
+	// all input until dismissed.
+	helpOpen bool
+
 	// initialCmd is the load tick scheduled at construction time; returned
 	// from Init() so the first focused node gets explained on startup.
 	initialCmd tea.Cmd
@@ -162,6 +166,12 @@ type Model struct {
 // while tokens are streaming.
 type qaState struct {
 	input string
+
+	// inputActive distinguishes "typing into the question box" from "Q&A tab
+	// is on screen but the user is using shortcuts." When false, keystrokes
+	// flow through updateNav so j/k can scroll, h can open help, etc. Pressing
+	// i or enter re-enters input mode; Esc leaves it.
+	inputActive bool
 
 	nodeThreads map[model.NodeID][]llm.Turn
 	sessionLog  []llm.Turn
@@ -789,6 +799,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, listenUsage(m.usageCh)
 
 	case tea.KeyMsg:
+		// Help overlay is modal: any key dismisses it (so the user can read
+		// once, then continue working).
+		if m.helpOpen {
+			return m.updateHelp(msg)
+		}
 		// Search overlay swallows all input (except via its own exit keys) so
 		// typed letters don't fire vim bindings while the user is filtering.
 		if m.search.open {
@@ -805,7 +820,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "tab", "shift+tab", "alt+1", "alt+2", "alt+3", "[", "]":
 			return m.updateNav(msg)
 		}
-		if m.activePane == paneExp && qaTabMode(m.expTab) != "" {
+		if m.activePane == paneExp && qaTabMode(m.expTab) != "" && m.qa.inputActive {
 			return m.updateQA(msg)
 		}
 		return m.updateNav(msg)
@@ -879,12 +894,19 @@ func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if qaTabMode(m.expTab) == "" {
 			m.expTab = expTabNodeQA
 		}
+		// Opening Q&A puts the cursor in the input box — that's what the user
+		// just asked for by pressing '?'.
+		m.qa.inputActive = true
 		m.resetVim()
 		return m, nil
 	case "/":
 		m.resetVim()
 		cmd := m.openSearch()
 		return m, cmd
+	case "h":
+		m.resetVim()
+		m.helpOpen = true
+		return m, nil
 	case "r":
 		m.resetVim()
 		delete(m.expCache, m.currentID)
@@ -920,6 +942,25 @@ func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		// Any other key cancels the pending yank — vim convention.
 		m.statusMsg = ""
+	}
+
+	// Re-enter Q&A input mode from the inactive state. This branch only runs
+	// when updateQA didn't claim the key (i.e. inputActive is false), so we
+	// can safely treat i/Enter as "start typing" without stealing Enter from
+	// the question-send path.
+	if m.activePane == paneExp && qaTabMode(m.expTab) != "" && !m.qa.inputActive {
+		switch s {
+		case "i", "enter":
+			m.qa.inputActive = true
+			m.resetVim()
+			return m, nil
+		case "esc":
+			// Second Esc (after one already deactivated input) closes the
+			// Q&A tab and returns to the plain explanation.
+			m.expTab = expTabPlain
+			m.resetVim()
+			return m, nil
+		}
 	}
 
 	// Pane-specific keys.
@@ -1139,7 +1180,9 @@ func (m Model) updateTreePane(s string) (tea.Model, tea.Cmd) {
 			m.activePane = paneSrc
 		}
 		return m, nil
-	case "h", "left":
+	case "left":
+		// "h" used to alias to this; it's now the global help binding (see
+		// updateNav). Left-arrow still collapses / climbs to parent.
 		m.resetVim()
 		rows = m.tree.Rows()
 		if m.cursor < len(rows) && rows[m.cursor].Expanded {
@@ -1287,10 +1330,10 @@ func (m *Model) focusID(id model.NodeID) tea.Cmd {
 func (m Model) updateQA(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEsc:
-		m.expTab = expTabPlain
-		if m.qa.cancel != nil {
-			m.qa.cancel()
-		}
+		// First Esc just exits the input field — shortcuts then become
+		// available without losing the Q&A history. A second Esc (handled in
+		// updateNav once inputActive is false) closes the tab.
+		m.qa.inputActive = false
 		return m, nil
 	case tea.KeyCtrlC:
 		if m.qa.cancel != nil {
@@ -1500,6 +1543,11 @@ func (m Model) View() string {
 
 	row := lipgloss.JoinHorizontal(lipgloss.Top, treeBox, center)
 	base := lipgloss.JoinVertical(lipgloss.Left, row, m.renderStatus())
+	if m.helpOpen {
+		w, h := helpOverlayDims(m.width, m.height)
+		overlay := m.renderHelp(w-2, h-2)
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, overlay, lipgloss.WithWhitespaceChars(" "))
+	}
 	if m.search.open {
 		w, h := searchOverlayDims(m.width, m.height)
 		overlay := m.renderSearch(w-2, h-2) // -2 for the rounded border
@@ -1785,7 +1833,11 @@ func (m Model) renderQA(mode string, w, h int) string {
 	if m.currentID.Path != "" {
 		b.WriteString(dimStyle.Render(sessionTag(m.currentID)) + "\n")
 	}
-	b.WriteString(dimStyle.Render("(Esc to close, Ctrl-C to interrupt)") + "\n\n")
+	if m.qa.inputActive {
+		b.WriteString(dimStyle.Render("(Esc to stop typing, Ctrl-C to interrupt)") + "\n\n")
+	} else {
+		b.WriteString(dimStyle.Render("(i or ⏎ to type, Esc to close Q&A, [h] for help)") + "\n\n")
+	}
 
 	for _, t := range m.qa.threadFor(mode, m.currentID) {
 		who := "you"
@@ -1797,32 +1849,66 @@ func (m Model) renderQA(mode string, w, h int) string {
 	if m.qa.streamVisible(mode, m.currentID) && m.qa.stream != "" {
 		fmt.Fprintf(&b, "%s: %s\n\n", titleStyle.Render("claude"), wrap(m.qa.stream, w))
 	}
-	b.WriteString(dimStyle.Render("> ") + m.qa.input + "_")
+	// Cursor (`_`) only when input is active; otherwise show the input as a
+	// quiet preview so the user knows what they had typed.
+	cursor := ""
+	if m.qa.inputActive {
+		cursor = "_"
+	}
+	b.WriteString(dimStyle.Render("> ") + m.qa.input + cursor)
 	return b.String()
 }
 
 func (m Model) renderStatus() string {
-	var keys string
-	if m.activePane == paneExp && qaTabMode(m.expTab) != "" {
-		keys = "[Enter] send  [Esc] back to Explanation  [Ctrl-C] interrupt  " + dimStyle.Render("[ [ / ] ] tab  [Tab] pane")
-	} else {
-		paneKeys := ""
-		switch m.activePane {
-		case paneTree:
-			paneKeys = "[j/k] nav  [Space] expand  [Enter] view  [h] collapse  [gg/G] top/bot"
-		case paneExp:
-			paneKeys = "[j/k] scroll prose  [gg] top"
-		case paneSrc:
-			paneKeys = "[j/k] line  [J/K] page  [gg/G] top/bot  [Ngg] line N"
-		}
-		if m.count > 0 {
-			paneKeys = fmt.Sprintf("(%d) ", m.count) + paneKeys
-		} else if m.pendingG {
-			paneKeys = "(g) " + paneKeys
-		}
-		keys = paneKeys + dimStyle.Render("  •  [Alt+1-3/Tab] pane  [ [ / ] ] tab  [b] back  [u/d] callers/callees  [?] ask  [r] regen  [e] edit  [y] yank  [q] quit")
+	keys := m.statusHints()
+	if m.count > 0 {
+		keys = fmt.Sprintf("(%d) ", m.count) + keys
+	} else if m.pendingG {
+		keys = "(g) " + keys
+	} else if m.pendingY {
+		keys = "(y) " + keys
 	}
 	return keys + "  " + m.renderUsage() + m.statusMsg
+}
+
+// statusHints returns the context-appropriate slice of shortcut prompts for
+// the bottom status line. Everything else is hidden behind the [h] help
+// overlay — the status line is a glance, not a reference manual.
+func (m Model) statusHints() string {
+	// Overlays own their own footers. Keep the status line muted so it
+	// doesn't compete with the overlay's hint text.
+	if m.helpOpen {
+		return dimStyle.Render("[any key] close help")
+	}
+	if m.search.open {
+		return dimStyle.Render("[Esc] cancel  [⏎] open  [↑/↓] navigate")
+	}
+	if m.xref.open {
+		return dimStyle.Render("[Esc] cancel  [⏎] open  [j/k] navigate")
+	}
+	if m.pendingY {
+		return "yank: [p] path  [e] explanation  [s] source  " + dimStyle.Render("(any other key cancels)")
+	}
+
+	tail := dimStyle.Render("  •  [h] help  [q] quit")
+
+	// Q&A tab special-cases: input vs. read-only.
+	if m.activePane == paneExp && qaTabMode(m.expTab) != "" {
+		if m.qa.inputActive {
+			return "[⏎] send  [Esc] stop typing  [Ctrl-C] interrupt" + tail
+		}
+		return "[i/⏎] type  [j/k] scroll  [Esc] close Q&A  [ [ / ] ] tab" + tail
+	}
+
+	switch m.activePane {
+	case paneTree:
+		return "[j/k] nav  [⏎] view  [Space] expand  [/] search  [?] ask" + tail
+	case paneExp:
+		return "[j/k] scroll  [?] ask  [r] regen  [y] yank  [b] back" + tail
+	case paneSrc:
+		return "[j/k] line  [J/K] page  [u] callers  [d] callees  [e] edit  [y] yank" + tail
+	}
+	return tail
 }
 
 // renderUsage formats the session's running token total for the status bar.

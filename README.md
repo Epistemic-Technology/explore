@@ -90,7 +90,7 @@ Navigation is vim-ish. A few essentials:
 - `j k l` / arrows — move in the tree; `l` / `space` expands, `←` collapses or moves to parent
 - `gg` / `G` — top / bottom; prefix any motion with a count (e.g. `10j`)
 - `enter` — focus the source pane on the current node
-- `tab` / `shift+tab` — cycle panes; `alt+1/2/3` — jump to tree / explanation / source
+- `tab` / `shift+tab` — cycle panes; `1` / `2` / `3` — jump to tree / explanation / source
 - `[` / `]` — cycle tabs within the explanation pane
 - `b` or `ctrl+o` — back in the nav stack; `ctrl+i` — forward
 - `?` — open the Q&A tab (questions are scoped to the focused node); inside Q&A, `esc` exits the input so shortcuts work, `i` or `enter` re-enters

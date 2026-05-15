@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -87,6 +88,13 @@ type Model struct {
 	sourceLine  int
 	srcScroll   int // first visible line index (0-based)
 
+	// Line-selection state for the source pane. selecting=true means `v` was
+	// pressed and the user is extending a range; selectAnchor is the 1-based
+	// file line where selection started. The active end is m.sourceLine, so
+	// j/k/J/K naturally extend the selection.
+	selecting    bool
+	selectAnchor int
+
 	// Scroll position for the prose pane.
 	proseScroll int
 
@@ -148,6 +156,12 @@ type Model struct {
 	// all input until dismissed.
 	helpOpen bool
 
+	// lineEntry is the ":" go-to-line prompt for the source pane. While
+	// active it swallows input: digits build lineBuf, Enter jumps, Esc
+	// cancels.
+	lineEntry bool
+	lineBuf   string
+
 	// initialCmd is the load tick scheduled at construction time; returned
 	// from Init() so the first focused node gets explained on startup.
 	initialCmd tea.Cmd
@@ -181,6 +195,13 @@ type qaState struct {
 	cancel     context.CancelFunc
 	streamMode string
 	streamFor  model.NodeID
+
+	// scroll is the number of lines scrolled UP from the bottom of the
+	// rendered Q&A buffer. 0 keeps the input prompt anchored at the bottom
+	// (the default and what we want during streaming); positive values
+	// reveal earlier history. Reset on send / explain so new content is
+	// visible.
+	scroll int
 }
 
 func (q *qaState) threadFor(mode string, id model.NodeID) []llm.Turn {
@@ -655,6 +676,39 @@ func (m *Model) moveSourceCursor(delta int) tea.Cmd {
 	return m.syncCurrent()
 }
 
+// selectionRange returns the inclusive 1-based line range currently
+// "highlighted" for an explain action. When selecting is true, the range
+// spans the anchor and current cursor (lower→higher). When selecting is
+// false, the range is just the single cursor line — so `x` without an
+// active selection explains the line the user is on.
+func (m Model) selectionRange() (start, end int) {
+	if !m.selecting {
+		return m.sourceLine, m.sourceLine
+	}
+	a, b := m.selectAnchor, m.sourceLine
+	if a > b {
+		a, b = b, a
+	}
+	return a, b
+}
+
+// sliceLines returns the inclusive 1-based [start,end] slice of src joined
+// by newlines. Out-of-range bounds are clamped; a fully empty result means
+// the range is past EOF or inverted.
+func sliceLines(src string, start, end int) string {
+	if start < 1 || end < start {
+		return ""
+	}
+	lines := strings.Split(src, "\n")
+	if start > len(lines) {
+		return ""
+	}
+	if end > len(lines) {
+		end = len(lines)
+	}
+	return strings.Join(lines[start-1:end], "\n")
+}
+
 func (m *Model) jumpSource(line int) tea.Cmd {
 	if m.currentFile == "" {
 		return nil
@@ -812,12 +866,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.xref.open {
 			return m.updateXref(msg)
 		}
+		// The ":" go-to-line prompt is modal like search: it swallows all
+		// input so digits don't fire vim bindings while typing a line number.
+		if m.lineEntry {
+			return m.updateLineEntry(msg)
+		}
 		// These bindings must work even when the Q&A input is collecting
 		// keystrokes — otherwise you'd be trapped in the input with no way
 		// to switch panes or tabs. Trade-off: literal '[' / ']' can't be
-		// typed into a Q&A question.
+		// typed into a Q&A question. Bare 1/2/3 are reserved for nav mode
+		// so they remain typable inside the input.
 		switch msg.String() {
-		case "tab", "shift+tab", "alt+1", "alt+2", "alt+3", "[", "]":
+		case "tab", "shift+tab", "[", "]":
 			return m.updateNav(msg)
 		}
 		if m.activePane == paneExp && qaTabMode(m.expTab) != "" && m.qa.inputActive {
@@ -830,6 +890,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	s := msg.String()
+
+	// Bare 1/2/3 jump to a pane when no count is in progress. Once a count
+	// has started (e.g. "5"), subsequent 1/2/3 keep accumulating so "51j"
+	// still works.
+	if m.count == 0 {
+		switch s {
+		case "1":
+			m.activePane = paneTree
+			m.resetVim()
+			return m, nil
+		case "2":
+			m.enterExpPane()
+			m.resetVim()
+			return m, nil
+		case "3":
+			m.activePane = paneSrc
+			m.resetVim()
+			return m, nil
+		}
+	}
 
 	// Vim-style count prefix: bare digits accumulate before a movement key.
 	if len(s) == 1 && s[0] >= '0' && s[0] <= '9' {
@@ -848,24 +928,18 @@ func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "ctrl+c":
 		return m, tea.Quit
-	case "alt+1":
-		m.activePane = paneTree
-		m.resetVim()
-		return m, nil
-	case "alt+2":
-		m.activePane = paneExp
-		m.resetVim()
-		return m, nil
-	case "alt+3":
-		m.activePane = paneSrc
-		m.resetVim()
-		return m, nil
 	case "tab":
 		m.activePane = (m.activePane % paneCount) + 1
+		if m.activePane == paneExp {
+			m.enterExpPane()
+		}
 		m.resetVim()
 		return m, nil
 	case "shift+tab":
 		m.activePane = ((m.activePane - 2 + paneCount) % paneCount) + 1
+		if m.activePane == paneExp {
+			m.enterExpPane()
+		}
 		m.resetVim()
 		return m, nil
 	case "]":
@@ -876,7 +950,7 @@ func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cycleTab(-1)
 		m.resetVim()
 		return m, nil
-	case "b", "ctrl+o":
+	case "o", "b", "ctrl+o":
 		m.resetVim()
 		if id, ok := m.stack.Back(); ok {
 			return m, m.focusID(id)
@@ -889,24 +963,13 @@ func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "?":
-		m.activePane = paneExp
-		// Default to node-scoped on first open; [ / ] cycles to session.
-		if qaTabMode(m.expTab) == "" {
-			m.expTab = expTabNodeQA
-		}
-		// Opening Q&A puts the cursor in the input box — that's what the user
-		// just asked for by pressing '?'.
-		m.qa.inputActive = true
 		m.resetVim()
+		m.helpOpen = true
 		return m, nil
 	case "/":
 		m.resetVim()
 		cmd := m.openSearch()
 		return m, cmd
-	case "h":
-		m.resetVim()
-		m.helpOpen = true
-		return m, nil
 	case "r":
 		m.resetVim()
 		delete(m.expCache, m.currentID)
@@ -970,10 +1033,41 @@ func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case paneSrc:
 		return m.updateSourcePane(s)
 	case paneExp:
+		// Q&A tabs use a bottom-anchored scroll (qa.scroll), so j/k there
+		// reveal *earlier* content rather than scrolling down from the top
+		// like the plain prose pane.
+		if qaTabMode(m.expTab) != "" {
+			m.qa.scroll = m.scrollQA(s, m.qa.scroll)
+			return m, nil
+		}
 		m.proseScroll = m.scrollPane(s, m.proseScroll)
 		return m, nil
 	}
 	return m, nil
+}
+
+// scrollQA mirrors scrollPane but for a bottom-anchored buffer: k (up) /
+// pgup *increase* scroll (reveal earlier turns), j (down) / pgdn decrease
+// it back toward the prompt at 0.
+func (m *Model) scrollQA(s string, current int) int {
+	switch s {
+	case "k", "up":
+		m.pendingG = false
+		return current + m.takeCount(1)
+	case "j", "down":
+		m.pendingG = false
+		return max(0, current-m.takeCount(1))
+	case "K", "ctrl+u", "pgup":
+		m.pendingG = false
+		return current + 10*m.takeCount(1)
+	case "J", "ctrl+d", "pgdown":
+		m.pendingG = false
+		return max(0, current-10*m.takeCount(1))
+	case "G":
+		m.pendingG = false
+		return 0
+	}
+	return current
 }
 
 // xrefEntries returns Metadata.Callers (when up=true) or Metadata.Callees for
@@ -1118,6 +1212,35 @@ func (m *Model) takeCount(def int) int {
 	return n
 }
 
+// updateLineEntry handles keys while the ":" go-to-line prompt is active in
+// the source pane. Only digits are accepted; Enter jumps to the typed line,
+// Esc/Ctrl+C cancels. An empty or invalid buffer is a no-op on Enter.
+func (m Model) updateLineEntry(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.lineEntry = false
+		m.lineBuf = ""
+		return m, nil
+	case "enter":
+		m.lineEntry = false
+		buf := m.lineBuf
+		m.lineBuf = ""
+		if n, err := strconv.Atoi(buf); err == nil && n > 0 {
+			return m, m.jumpSource(n)
+		}
+		return m, nil
+	case "backspace":
+		if len(m.lineBuf) > 0 {
+			m.lineBuf = m.lineBuf[:len(m.lineBuf)-1]
+		}
+		return m, nil
+	}
+	if s := msg.String(); len(s) == 1 && s[0] >= '0' && s[0] <= '9' && len(m.lineBuf) < 7 {
+		m.lineBuf += s
+	}
+	return m, nil
+}
+
 func (m *Model) resetVim() {
 	m.count = 0
 	m.pendingG = false
@@ -1135,6 +1258,17 @@ func (m *Model) cycleTab(delta int) {
 	case paneExp:
 		m.expTab = (m.expTab + delta + len(tabs)) % len(tabs)
 	}
+}
+
+// enterExpPane focuses the explanation pane and drops straight into the Q&A
+// input. If the pane is currently on the Plain Explanation tab (which has no
+// input box), it switches to Node Q&A so there is somewhere to type.
+func (m *Model) enterExpPane() {
+	m.activePane = paneExp
+	if qaTabMode(m.expTab) == "" {
+		m.expTab = expTabNodeQA
+	}
+	m.qa.inputActive = true
 }
 
 func (m Model) updateTreePane(s string) (tea.Model, tea.Cmd) {
@@ -1180,9 +1314,9 @@ func (m Model) updateTreePane(s string) (tea.Model, tea.Cmd) {
 			m.activePane = paneSrc
 		}
 		return m, nil
-	case "left":
-		// "h" used to alias to this; it's now the global help binding (see
-		// updateNav). Left-arrow still collapses / climbs to parent.
+	case "left", "h":
+		// Collapse the focused node, or climb to its parent if already
+		// collapsed (vim-style left).
 		m.resetVim()
 		rows = m.tree.Rows()
 		if m.cursor < len(rows) && rows[m.cursor].Expanded {
@@ -1233,9 +1367,88 @@ func (m Model) updateSourcePane(s string) (tea.Model, tea.Cmd) {
 			return m, m.jumpSource(lineCount(src))
 		}
 		return m, nil
+	case ":":
+		m.resetVim()
+		m.lineEntry = true
+		m.lineBuf = ""
+		return m, nil
+	case "v":
+		m.resetVim()
+		if m.currentFile == "" {
+			return m, nil
+		}
+		if m.selecting {
+			m.selecting = false
+			m.statusMsg = ""
+		} else {
+			m.selecting = true
+			m.selectAnchor = m.sourceLine
+		}
+		return m, nil
+	case "x":
+		m.resetVim()
+		return m.explainSelection()
+	case "esc":
+		if m.selecting {
+			m.selecting = false
+			m.statusMsg = ""
+		}
+		m.resetVim()
+		return m, nil
 	}
 	m.resetVim()
 	return m, nil
+}
+
+// explainSelection asks Q&A to explain the currently-selected line range (or
+// just the cursor line if no selection is active). The synthesized question
+// is appended to the node-scoped Q&A thread for the current focus and the
+// view switches to the node Q&A tab so the streamed answer is visible.
+func (m Model) explainSelection() (tea.Model, tea.Cmd) {
+	if m.currentFile == "" {
+		m.statusMsg = "explain: no file selected"
+		return m, nil
+	}
+	src, ok := m.sourceCache[m.currentFile]
+	if !ok {
+		m.statusMsg = "explain: source not loaded"
+		return m, nil
+	}
+	if m.qa.streamCh != nil {
+		m.statusMsg = "explain: wait for current Q&A to finish"
+		return m, nil
+	}
+	startLine, endLine := m.selectionRange()
+	snippet := sliceLines(src, startLine, endLine)
+	if strings.TrimSpace(snippet) == "" {
+		m.statusMsg = "explain: empty selection"
+		return m, nil
+	}
+
+	var qb strings.Builder
+	if startLine == endLine {
+		fmt.Fprintf(&qb, "Explain line %d — what it does and why it's there in the surrounding function/file. Keep it to a short, focused paragraph.\n```\n%s\n```", startLine, snippet)
+	} else {
+		fmt.Fprintf(&qb, "Explain lines %d-%d — what they do and why they're there in the surrounding function/file. Keep it to a short, focused paragraph.\n```\n%s\n```", startLine, endLine, snippet)
+	}
+	question := qb.String()
+
+	m.selecting = false
+	m.statusMsg = ""
+	m.enterExpPane()
+	// The synthesized answer streams into the node thread, so force the
+	// Node Q&A tab regardless of which Q&A tab enterExpPane settled on.
+	m.expTab = expTabNodeQA
+	m.qa.scroll = 0
+
+	id := m.currentID
+	m.qa.streamMode = "node"
+	m.qa.streamFor = id
+	m.qa.nodeThreads[id] = append(m.qa.nodeThreads[id], llm.Turn{Role: "user", Content: question})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.qa.cancel = cancel
+	return m, m.askCmd(ctx, id, "node", question)
 }
 
 // scrollPane is shared by the prose and metadata panes: j/k for line, J/K for page.
@@ -1348,6 +1561,9 @@ func (m Model) updateQA(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.qa.input = ""
+		// Snap to bottom so the user sees their question and the streaming
+		// reply, rather than staying scrolled in old history.
+		m.qa.scroll = 0
 
 		// Snapshot mode + node so the assistant turn lands in the right thread
 		// even if the user switches tabs or navigates mid-stream.
@@ -1512,6 +1728,11 @@ var (
 	titleInactive = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	selectedStyle = lipgloss.NewStyle().Background(lipgloss.Color("237")).Bold(true)
 	curLineStyle  = lipgloss.NewStyle().Background(lipgloss.Color("236"))
+	selRangeStyle = lipgloss.NewStyle().Background(lipgloss.Color("24"))
+	// In selection mode the cursor row is part of the range; a brighter blue
+	// keeps it visually distinct from the rest of the selection while making
+	// clear it's included in the explanation.
+	selCursorStyle = lipgloss.NewStyle().Background(lipgloss.Color("31"))
 
 	paneBorder       = lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("241"))
 	activePaneBorder = lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("12"))
@@ -1732,6 +1953,7 @@ func (m Model) renderSource(w, h int) string {
 	if contentW < 1 {
 		contentW = 1
 	}
+	selStart, selEnd := m.selectionRange()
 	// spanIdx advances forward as we iterate lines, since spans are sorted
 	// by Start. Lets us skip the binary search per line.
 	spanIdx := 0
@@ -1746,13 +1968,25 @@ func (m Model) renderSource(w, h int) string {
 		num := fmt.Sprintf("%*d", gutterW, i+1)
 
 		var content string
-		if i+1 == m.sourceLine {
-			// Cursor row: drop syntax highlighting so curLineStyle's bg
-			// applies cleanly. Reader sees their position clearly; the
-			// surrounding rows still carry full color.
+		isCursor := i+1 == m.sourceLine
+		inSelection := m.selecting && i+1 >= selStart && i+1 <= selEnd
+		if isCursor || inSelection {
+			// Drop syntax highlighting so the bg applies cleanly. The cursor
+			// row is always part of the selection when selecting (it's one
+			// edge of the range), so we render it with a brighter selection
+			// shade rather than the plain cursor bg — that way the user sees
+			// the whole range that will be explained, not just the rows
+			// behind the cursor.
 			plain := strings.ReplaceAll(lines[i], "\t", "    ")
 			plain = truncate(plain, contentW)
-			content = curLineStyle.Render(fmt.Sprintf("%s %s", num, padRight(plain, contentW)))
+			style := curLineStyle
+			switch {
+			case m.selecting && isCursor:
+				style = selCursorStyle
+			case inSelection:
+				style = selRangeStyle
+			}
+			content = style.Render(fmt.Sprintf("%s %s", num, padRight(plain, contentW)))
 			b.WriteString(content + "\n")
 			continue
 		}
@@ -1839,15 +2073,23 @@ func (m Model) renderQA(mode string, w, h int) string {
 		b.WriteString(dimStyle.Render("(i or ⏎ to type, Esc to close Q&A, [h] for help)") + "\n\n")
 	}
 
+	// `claude: ` (longest prefix) takes 8 visible columns. Reduce the wrap
+	// width so the first line of each turn — which carries that prefix —
+	// fits the pane without the terminal re-wrapping and stranding the
+	// overflow words on a line of their own.
+	contentW := w - len("claude: ")
+	if contentW < 1 {
+		contentW = w
+	}
 	for _, t := range m.qa.threadFor(mode, m.currentID) {
 		who := "you"
 		if t.Role == "assistant" {
 			who = "claude"
 		}
-		fmt.Fprintf(&b, "%s: %s\n\n", titleStyle.Render(who), wrap(t.Content, w))
+		fmt.Fprintf(&b, "%s: %s\n\n", titleStyle.Render(who), wrap(displayContent(t.Content), contentW))
 	}
 	if m.qa.streamVisible(mode, m.currentID) && m.qa.stream != "" {
-		fmt.Fprintf(&b, "%s: %s\n\n", titleStyle.Render("claude"), wrap(m.qa.stream, w))
+		fmt.Fprintf(&b, "%s: %s\n\n", titleStyle.Render("claude"), wrap(m.qa.stream, contentW))
 	}
 	// Cursor (`_`) only when input is active; otherwise show the input as a
 	// quiet preview so the user knows what they had typed.
@@ -1856,10 +2098,54 @@ func (m Model) renderQA(mode string, w, h int) string {
 		cursor = "_"
 	}
 	b.WriteString(dimStyle.Render("> ") + m.qa.input + cursor)
-	return b.String()
+	full := b.String()
+	// Bottom-anchored window: m.qa.scroll counts lines scrolled UP from the
+	// bottom (0 keeps the input prompt pinned). Clamp so we don't scroll past
+	// the top, then show a height-h slice ending `scroll` lines above the
+	// bottom. Without this, a long pre-filled question (e.g. from `x`
+	// explain) pushes the prompt out of the box and the user can't see what
+	// they're typing — and j/k can't reveal earlier content either.
+	if h <= 0 {
+		return full
+	}
+	lines := strings.Split(full, "\n")
+	if len(lines) <= h {
+		return full
+	}
+	maxScroll := len(lines) - h
+	scroll := m.qa.scroll
+	if scroll < 0 {
+		scroll = 0
+	}
+	if scroll > maxScroll {
+		scroll = maxScroll
+	}
+	end := len(lines) - scroll
+	start := end - h
+	return strings.Join(lines[start:end], "\n")
+}
+
+// displayContent shortens canned `x`-explain prompts to just the line
+// reference. The full snippet is still in t.Content so it goes to the model
+// in conversation history; the pane just doesn't echo the source the user
+// already has on screen in the source pane.
+func displayContent(c string) string {
+	if !strings.HasPrefix(c, "Explain line") {
+		return c
+	}
+	if i := strings.Index(c, " — "); i >= 0 {
+		return c[:i]
+	}
+	if i := strings.IndexAny(c, "\n:"); i >= 0 {
+		return c[:i]
+	}
+	return c
 }
 
 func (m Model) renderStatus() string {
+	if m.lineEntry {
+		return ":" + m.lineBuf + dimStyle.Render("  (Enter to jump · Esc to cancel)")
+	}
 	keys := m.statusHints()
 	if m.count > 0 {
 		keys = fmt.Sprintf("(%d) ", m.count) + keys
@@ -1906,7 +2192,10 @@ func (m Model) statusHints() string {
 	case paneExp:
 		return "[j/k] scroll  [?] ask  [r] regen  [y] yank  [b] back" + tail
 	case paneSrc:
-		return "[j/k] line  [J/K] page  [u] callers  [d] callees  [e] edit  [y] yank" + tail
+		if m.selecting {
+			return "[j/k] extend  [x] explain  [Esc] cancel" + tail
+		}
+		return "[j/k] line  [v] select  [x] explain  [u] callers  [d] callees  [e] edit" + tail
 	}
 	return tail
 }
@@ -1978,17 +2267,20 @@ func itoaInt(n int) string {
 
 // --- Util ---
 
+// truncate clamps s to a printable cell width of n, appending an ellipsis when
+// it overflows. It is ANSI- and wide-rune aware: callers pass styled strings
+// (lipgloss-rendered spans embed SGR escapes), so a byte-slice would both
+// miscount width and sever an escape sequence — leaving an unterminated SGR
+// that bleeds color/layout into adjacent panes. ansi.Truncate keeps escape
+// sequences balanced and never splits a rune.
 func truncate(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}
-	if len(s) <= n {
+	if ansi.StringWidth(s) <= n {
 		return s
 	}
-	if n <= 1 {
-		return s[:n]
-	}
-	return s[:n-1] + "…"
+	return ansi.Truncate(s, n, "…")
 }
 
 func padRight(s string, w int) string {
@@ -2003,8 +2295,20 @@ func wrap(s string, w int) string {
 		return s
 	}
 	var out strings.Builder
-	for _, para := range strings.Split(s, "\n") {
-		words := strings.Fields(para)
+	// Split on blank lines so paragraph breaks survive; within a paragraph
+	// the model's own mid-sentence wrapping (single \n) is treated as soft
+	// and reflowed at the pane width. Fenced code blocks are passed through
+	// as-is so source listings keep their layout.
+	paragraphs := strings.Split(s, "\n\n")
+	for i, para := range paragraphs {
+		if i > 0 {
+			out.WriteString("\n\n")
+		}
+		if strings.Contains(para, "```") {
+			out.WriteString(para)
+			continue
+		}
+		words := strings.Fields(strings.ReplaceAll(para, "\n", " "))
 		line := ""
 		for _, w0 := range words {
 			if line == "" {
@@ -2018,9 +2322,9 @@ func wrap(s string, w int) string {
 				line += " " + w0
 			}
 		}
-		out.WriteString(line + "\n")
+		out.WriteString(line)
 	}
-	return strings.TrimRight(out.String(), "\n")
+	return out.String()
 }
 
 func windowAround(cursor, height, total int) (int, int) {

@@ -5,20 +5,18 @@ package claude
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/mikethicke/explore/internal/debug"
 	"github.com/mikethicke/explore/internal/llm"
+	"github.com/mikethicke/explore/internal/llm/httpx"
 )
 
 const (
@@ -134,7 +132,7 @@ func (p *Provider) Explain(ctx context.Context, req llm.ExplainRequest) (*llm.Ex
 	debug.Logf("claude.Explain: HTTP 200, bodyLen=%d", len(body))
 	var resp messagesResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		debug.Logf("claude.Explain: decode err=%v bodyHead=%q", err, truncate(string(body), 200))
+		debug.Logf("claude.Explain: decode err=%v bodyHead=%q", err, httpx.Truncate(string(body), 200))
 		return nil, fmt.Errorf("claude: decode: %w", err)
 	}
 	var raw strings.Builder
@@ -153,117 +151,24 @@ func (p *Provider) Explain(ctx context.Context, req llm.ExplainRequest) (*llm.Ex
 }
 
 func (p *Provider) post(ctx context.Context, req any) ([]byte, error) {
-	b, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := p.doRequest(ctx, b, false)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	return httpx.PostJSON(ctx, p.http, req, p.request(false))
 }
 
-// doRequest sends a Messages API request with exponential-backoff retry on
-// transient failures (529 overloaded, 429 rate-limited, 5xx, network errors).
-// On success, the caller owns resp.Body; on error it has been drained/closed.
-// stream toggles the SSE accept header.
-func (p *Provider) doRequest(ctx context.Context, body []byte, stream bool) (*http.Response, error) {
-	var lastErr error
-	var nextWait time.Duration
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if nextWait > 0 {
-			t := time.NewTimer(nextWait)
-			select {
-			case <-ctx.Done():
-				t.Stop()
-				return nil, ctx.Err()
-			case <-t.C:
+func (p *Provider) request(stream bool) httpx.Request {
+	return httpx.Request{
+		URL: endpoint,
+		SetHeaders: func(r *http.Request) {
+			r.Header.Set("x-api-key", p.apiKey)
+			r.Header.Set("anthropic-version", apiVersion)
+			if stream {
+				r.Header.Set("accept", "text/event-stream")
 			}
-		}
-		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("x-api-key", p.apiKey)
-		req.Header.Set("anthropic-version", apiVersion)
-		if stream {
-			req.Header.Set("accept", "text/event-stream")
-		}
-		resp, err := p.http.Do(req)
-		if err != nil {
-			if ctx.Err() != nil {
-				debug.Logf("claude.doRequest: ctx canceled attempt=%d err=%v", attempt, ctx.Err())
-				return nil, ctx.Err()
-			}
-			debug.Logf("claude.doRequest: transport err attempt=%d err=%v", attempt, err)
-			lastErr = err
-			nextWait = backoffFor(attempt)
-			continue
-		}
-		if resp.StatusCode == 200 {
-			debug.Logf("claude.doRequest: 200 attempt=%d stream=%v", attempt, stream)
-			return resp, nil
-		}
-		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		debug.Logf("claude.doRequest: status=%s attempt=%d body=%q", resp.Status, attempt, truncate(string(respBody), 300))
-		lastErr = fmt.Errorf("claude: %s: %s", resp.Status, truncate(string(respBody), 300))
-		if !retryableStatus(resp.StatusCode) {
-			return nil, lastErr
-		}
-		nextWait = backoffFor(attempt)
-		if d, ok := parseRetryAfter(resp.Header.Get("Retry-After")); ok {
-			nextWait = d
-		}
+		},
+		MaxAttempts: maxAttempts,
+		BackoffCap:  8 * time.Second,
+		Retryable:   httpx.RetryableStatus,
+		LogTag:      "claude",
 	}
-	return nil, lastErr
-}
-
-func retryableStatus(code int) bool {
-	switch code {
-	case 408, 425, 429, 500, 502, 503, 504, 529:
-		return true
-	}
-	return false
-}
-
-// backoffFor returns the delay before retry attempt (attempt+1): 1s, 2s, 4s,
-// 8s, capped, plus up to 50% jitter so concurrent clients don't synchronize.
-func backoffFor(attempt int) time.Duration {
-	base := time.Second << attempt
-	if base > 8*time.Second {
-		base = 8 * time.Second
-	}
-	jitter := time.Duration(rand.Int64N(int64(base / 2)))
-	return base + jitter
-}
-
-func parseRetryAfter(h string) (time.Duration, bool) {
-	h = strings.TrimSpace(h)
-	if h == "" {
-		return 0, false
-	}
-	if secs, err := strconv.Atoi(h); err == nil && secs >= 0 {
-		return time.Duration(secs) * time.Second, true
-	}
-	if t, err := http.ParseTime(h); err == nil {
-		d := time.Until(t)
-		if d < 0 {
-			d = 0
-		}
-		return d, true
-	}
-	return 0, false
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }
 
 // Ask streams a response. Tokens are emitted as text deltas; the channel is
@@ -312,7 +217,9 @@ func (p *Provider) Ask(ctx context.Context, req llm.AskRequest) (<-chan llm.Toke
 	if err != nil {
 		return nil, err
 	}
-	resp, err := p.doRequest(ctx, b, true)
+	r := p.request(true)
+	r.Body = b
+	resp, err := httpx.Do(ctx, p.http, r)
 	if err != nil {
 		debug.Logf("claude.Ask: doRequest err=%v", err)
 		return nil, err

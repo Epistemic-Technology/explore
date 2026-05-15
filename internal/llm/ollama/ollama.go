@@ -5,19 +5,17 @@ package ollama
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/mikethicke/explore/internal/debug"
 	"github.com/mikethicke/explore/internal/llm"
+	"github.com/mikethicke/explore/internal/llm/httpx"
 )
 
 const (
@@ -101,7 +99,7 @@ func (p *Provider) Explain(ctx context.Context, req llm.ExplainRequest) (*llm.Ex
 	debug.Logf("ollama.Explain: HTTP 200, bodyLen=%d", len(body))
 	var resp chatResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		debug.Logf("ollama.Explain: decode err=%v bodyHead=%q", err, truncate(string(body), 200))
+		debug.Logf("ollama.Explain: decode err=%v bodyHead=%q", err, httpx.Truncate(string(body), 200))
 		return nil, fmt.Errorf("ollama: decode: %w", err)
 	}
 	debug.Logf("ollama.Explain: rawLen=%d done=%v in=%d out=%d", len(resp.Message.Content), resp.Done, resp.PromptEvalCount, resp.EvalCount)
@@ -142,7 +140,9 @@ func (p *Provider) Ask(ctx context.Context, req llm.AskRequest) (<-chan llm.Toke
 	if err != nil {
 		return nil, err
 	}
-	resp, err := p.doRequest(ctx, "/api/chat", b)
+	r := p.request("/api/chat")
+	r.Body = b
+	resp, err := httpx.Do(ctx, p.http, r)
 	if err != nil {
 		debug.Logf("ollama.Ask: doRequest err=%v", err)
 		return nil, err
@@ -154,79 +154,19 @@ func (p *Provider) Ask(ctx context.Context, req llm.AskRequest) (<-chan llm.Toke
 }
 
 func (p *Provider) post(ctx context.Context, path string, req any) ([]byte, error) {
-	b, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := p.doRequest(ctx, path, b)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	return httpx.PostJSON(ctx, p.http, req, p.request(path))
 }
 
-// doRequest retries only on transient transport errors. Ollama is local;
-// rate limits and 5xx aren't a concern, but the daemon may briefly be
-// unreachable during model load.
-func (p *Provider) doRequest(ctx context.Context, path string, body []byte) (*http.Response, error) {
-	var lastErr error
-	var nextWait time.Duration
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if nextWait > 0 {
-			t := time.NewTimer(nextWait)
-			select {
-			case <-ctx.Done():
-				t.Stop()
-				return nil, ctx.Err()
-			case <-t.C:
-			}
-		}
-		req, err := http.NewRequestWithContext(ctx, "POST", p.host+path, bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := p.http.Do(req)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			debug.Logf("ollama.doRequest: transport err attempt=%d err=%v", attempt, err)
-			lastErr = err
-			nextWait = backoffFor(attempt)
-			continue
-		}
-		if resp.StatusCode == 200 {
-			return resp, nil
-		}
-		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		debug.Logf("ollama.doRequest: status=%s attempt=%d body=%q", resp.Status, attempt, truncate(string(respBody), 300))
-		lastErr = fmt.Errorf("ollama: %s: %s", resp.Status, truncate(string(respBody), 300))
-		// 5xx from Ollama is usually a load/OOM failure that won't self-heal in retries.
-		return nil, lastErr
+// request builds an httpx.Request for the given path. Retryable is nil because
+// 5xx from Ollama is usually a load/OOM failure that won't self-heal in
+// retries — only transport errors retry.
+func (p *Provider) request(path string) httpx.Request {
+	return httpx.Request{
+		URL:         p.host + path,
+		MaxAttempts: maxAttempts,
+		BackoffCap:  4 * time.Second,
+		LogTag:      "ollama",
 	}
-	if lastErr == nil {
-		lastErr = errors.New("ollama: exhausted retries")
-	}
-	return nil, lastErr
-}
-
-func backoffFor(attempt int) time.Duration {
-	base := time.Second << attempt
-	if base > 4*time.Second {
-		base = 4 * time.Second
-	}
-	jitter := time.Duration(rand.Int64N(int64(base / 2)))
-	return base + jitter
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }
 
 // streamNDJSON parses Ollama's newline-delimited JSON stream, emitting each

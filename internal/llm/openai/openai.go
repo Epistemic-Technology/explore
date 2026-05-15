@@ -6,20 +6,18 @@ package openai
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/mikethicke/explore/internal/debug"
 	"github.com/mikethicke/explore/internal/llm"
+	"github.com/mikethicke/explore/internal/llm/httpx"
 )
 
 const (
@@ -125,7 +123,7 @@ func (p *Provider) Explain(ctx context.Context, req llm.ExplainRequest) (*llm.Ex
 	debug.Logf("openai.Explain: HTTP 200, bodyLen=%d", len(body))
 	var resp chatResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		debug.Logf("openai.Explain: decode err=%v bodyHead=%q", err, truncate(string(body), 200))
+		debug.Logf("openai.Explain: decode err=%v bodyHead=%q", err, httpx.Truncate(string(body), 200))
 		return nil, fmt.Errorf("openai: decode: %w", err)
 	}
 	if len(resp.Choices) == 0 {
@@ -177,7 +175,9 @@ func (p *Provider) Ask(ctx context.Context, req llm.AskRequest) (<-chan llm.Toke
 	if err != nil {
 		return nil, err
 	}
-	resp, err := p.doRequest(ctx, b, true)
+	r := p.request(true)
+	r.Body = b
+	resp, err := httpx.Do(ctx, p.http, r)
 	if err != nil {
 		debug.Logf("openai.Ask: doRequest err=%v", err)
 		return nil, err
@@ -189,112 +189,23 @@ func (p *Provider) Ask(ctx context.Context, req llm.AskRequest) (<-chan llm.Toke
 }
 
 func (p *Provider) post(ctx context.Context, req any) ([]byte, error) {
-	b, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := p.doRequest(ctx, b, false)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	return httpx.PostJSON(ctx, p.http, req, p.request(false))
 }
 
-// doRequest sends with exponential-backoff retry on transient failures. On
-// success, the caller owns resp.Body; on error it has been drained/closed.
-func (p *Provider) doRequest(ctx context.Context, body []byte, stream bool) (*http.Response, error) {
-	var lastErr error
-	var nextWait time.Duration
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if nextWait > 0 {
-			t := time.NewTimer(nextWait)
-			select {
-			case <-ctx.Done():
-				t.Stop()
-				return nil, ctx.Err()
-			case <-t.C:
+func (p *Provider) request(stream bool) httpx.Request {
+	return httpx.Request{
+		URL: p.endpoint,
+		SetHeaders: func(r *http.Request) {
+			r.Header.Set("Authorization", "Bearer "+p.apiKey)
+			if stream {
+				r.Header.Set("Accept", "text/event-stream")
 			}
-		}
-		req, err := http.NewRequestWithContext(ctx, "POST", p.endpoint, bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
-		if stream {
-			req.Header.Set("Accept", "text/event-stream")
-		}
-		resp, err := p.http.Do(req)
-		if err != nil {
-			if ctx.Err() != nil {
-				debug.Logf("openai.doRequest: ctx canceled attempt=%d err=%v", attempt, ctx.Err())
-				return nil, ctx.Err()
-			}
-			debug.Logf("openai.doRequest: transport err attempt=%d err=%v", attempt, err)
-			lastErr = err
-			nextWait = backoffFor(attempt)
-			continue
-		}
-		if resp.StatusCode == 200 {
-			debug.Logf("openai.doRequest: 200 attempt=%d stream=%v", attempt, stream)
-			return resp, nil
-		}
-		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		debug.Logf("openai.doRequest: status=%s attempt=%d body=%q", resp.Status, attempt, truncate(string(respBody), 300))
-		lastErr = fmt.Errorf("openai: %s: %s", resp.Status, truncate(string(respBody), 300))
-		if !retryableStatus(resp.StatusCode) {
-			return nil, lastErr
-		}
-		nextWait = backoffFor(attempt)
-		if d, ok := parseRetryAfter(resp.Header.Get("Retry-After")); ok {
-			nextWait = d
-		}
+		},
+		MaxAttempts: maxAttempts,
+		BackoffCap:  8 * time.Second,
+		Retryable:   httpx.RetryableStatus,
+		LogTag:      "openai",
 	}
-	return nil, lastErr
-}
-
-func retryableStatus(code int) bool {
-	switch code {
-	case 408, 425, 429, 500, 502, 503, 504:
-		return true
-	}
-	return false
-}
-
-func backoffFor(attempt int) time.Duration {
-	base := time.Second << attempt
-	if base > 8*time.Second {
-		base = 8 * time.Second
-	}
-	jitter := time.Duration(rand.Int64N(int64(base / 2)))
-	return base + jitter
-}
-
-func parseRetryAfter(h string) (time.Duration, bool) {
-	h = strings.TrimSpace(h)
-	if h == "" {
-		return 0, false
-	}
-	if secs, err := strconv.Atoi(h); err == nil && secs >= 0 {
-		return time.Duration(secs) * time.Second, true
-	}
-	if t, err := http.ParseTime(h); err == nil {
-		d := time.Until(t)
-		if d < 0 {
-			d = 0
-		}
-		return d, true
-	}
-	return 0, false
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }
 
 // streamSSE parses OpenAI's event stream and emits choices[0].delta.content

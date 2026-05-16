@@ -11,6 +11,8 @@ const (
 	LevelDir    Level = "dir"
 	LevelFile   Level = "file"
 	LevelSymbol Level = "symbol"
+	LevelCommit Level = "commit"
+	LevelPR     Level = "pr"
 )
 
 // ExplainRequest carries everything a provider needs to produce a structured
@@ -47,6 +49,24 @@ type ExplainRequest struct {
 	// long-function threshold. BuildExplainUser appends a structural-outline
 	// instruction when this is set; providers themselves don't need to peek.
 	IsLong bool
+
+	// IsDiff marks a change-explanation request (a commit or a node's diff in
+	// snapshot mode). When set, BuildExplainUser emits CommitMessage + Diff and
+	// asks the model to explain what changed and why, instead of the standard
+	// "explain this code" framing. Same JSON schema as every other level, so
+	// providers need no special handling.
+	IsDiff        bool
+	CommitMessage string
+	Diff          string
+
+	// IsPR marks a pull-request review request. It implies a diff (Diff +
+	// PRTitle/PRBody are emitted) but BuildExplainUser frames the output as a
+	// reviewer's read — risks, what to scrutinize, test gaps — rather than the
+	// neutral "what changed and why" of a commit. Same JSON schema; providers
+	// need no special handling.
+	IsPR    bool
+	PRTitle string
+	PRBody  string
 }
 
 type Explanation struct {

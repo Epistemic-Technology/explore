@@ -128,7 +128,7 @@ func (m *Model) jumpToSymbolRef(ref model.SymbolRef) tea.Cmd {
 		return nil
 	}
 	m.cursor = row
-	m.stack.Push(id)
+	m.stack.Push(id, m.currentRev())
 	cmd := m.focusID(id)
 	if ref.Line > 0 && m.currentFile == ref.Path {
 		m.sourceLine = ref.Line
@@ -174,7 +174,10 @@ func (m Model) renderXref(w, h int) string {
 	body := listCol
 	if previewW > 0 {
 		preview := m.renderXrefPreview(previewW, listH)
-		body = lipgloss.JoinHorizontal(lipgloss.Top, listCol, preview)
+		// splitXrefWidth reserves 2 cols for this gutter; without it the
+		// list text abuts the preview source with no breathing room.
+		gutter := lipgloss.NewStyle().Width(2).Render("")
+		body = lipgloss.JoinHorizontal(lipgloss.Top, listCol, gutter, preview)
 	}
 
 	full := header + "\n\n" + body + "\n" + footer
@@ -228,7 +231,17 @@ func (m Model) renderXrefPreview(w, h int) string {
 	}
 	ref := m.xref.entries[m.xref.cursor]
 	body := m.xrefPreviewBody(ref, h)
-	return lipgloss.NewStyle().Width(w).MaxHeight(h).Render(body)
+	// lipgloss Width *wraps* overflowing lines, which folds long source rows
+	// onto the next line and desyncs the preview from the list. Truncate each
+	// line to the column width instead so every source row stays on its row.
+	lines := strings.Split(body, "\n")
+	if len(lines) > h {
+		lines = lines[:h]
+	}
+	for i, ln := range lines {
+		lines[i] = truncate(ln, w)
+	}
+	return lipgloss.NewStyle().Width(w).Render(strings.Join(lines, "\n"))
 }
 
 // xrefPreviewBody computes (and caches) the preview snippet for one ref.
@@ -320,6 +333,10 @@ type callersResultMsg struct {
 // pre-populated callers), this fires a tea.Cmd so `u` works immediately
 // after `d`-jumping to a fresh symbol, before its explanation has loaded.
 func (m Model) openCallersOf() (tea.Model, tea.Cmd) {
+	if m.atCommitSnapshot() {
+		m.statusMsg = "xref unavailable in a history snapshot (LSP indexes the working tree)"
+		return m, nil
+	}
 	if m.currentID.Kind != model.KindSymbol {
 		m.statusMsg = "callers: focus a symbol first (currently on " + m.currentID.Kind.String() + ")"
 		return m, nil
@@ -378,8 +395,12 @@ type calleesOnLineMsg struct {
 // the result asynchronously via calleesOnLineMsg, so the LSP roundtrip doesn't
 // block the UI.
 func (m Model) openCalleesOnLine() (tea.Model, tea.Cmd) {
+	if m.atCommitSnapshot() {
+		m.statusMsg = "xref unavailable in a history snapshot (LSP indexes the working tree)"
+		return m, nil
+	}
 	if m.activePane != paneSrc {
-		m.statusMsg = "callees: switch to the source pane (alt+3) to pick a line"
+		m.statusMsg = "callees: switch to the source pane (3) to pick a line"
 		return m, nil
 	}
 	if m.currentFile == "" {

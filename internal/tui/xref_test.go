@@ -7,9 +7,44 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/mikethicke/explore/internal/model"
 )
+
+// Regression: xref/search rows embed lipgloss SGR escapes (e.g. the dim
+// ":line" suffix from formatXrefRef). A byte-slice truncate severed those
+// escapes, leaving an unterminated sequence that bled color/layout into the
+// preview pane. truncate must measure printable width and keep escapes balanced.
+func TestTruncate_ANSIAware(t *testing.T) {
+	styled := dimStyle.Render("internal/tui/model.go::formatTokenCount") +
+		dimStyle.Render(":2188")
+
+	if got := truncate(styled, 80); ansi.StringWidth(got) > 80 {
+		t.Fatalf("untruncated styled string width = %d, want <= 80", ansi.StringWidth(got))
+	}
+
+	out := truncate(styled, 20)
+	if w := ansi.StringWidth(out); w > 20 {
+		t.Fatalf("truncated width = %d, want <= 20", w)
+	}
+	if !strings.HasSuffix(ansi.Strip(out), "…") {
+		t.Fatalf("expected ellipsis tail, got %q", ansi.Strip(out))
+	}
+	// An unbalanced escape sequence is the actual corruption symptom: every
+	// SGR introducer must be matched by content that ansi.Strip can resolve
+	// without leaving a dangling CSI.
+	if strings.Contains(ansi.Strip(out), "\x1b") {
+		t.Fatalf("truncated output has dangling escape: %q", out)
+	}
+
+	if truncate("short", 0) != "" {
+		t.Fatal("n<=0 must yield empty string")
+	}
+	if got := truncate("plain", 10); got != "plain" {
+		t.Fatalf("fitting string altered: %q", got)
+	}
+}
 
 func TestXrefEntries_ReadsMetadata(t *testing.T) {
 	id := model.NodeID{Kind: model.KindSymbol, Path: "x.go", Symbol: "Foo"}

@@ -2,11 +2,11 @@ package tui
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/mikethicke/explore/internal/gitsrc"
 	"github.com/mikethicke/explore/internal/model"
 	"github.com/mikethicke/explore/internal/tsparse"
 )
@@ -15,6 +15,7 @@ import (
 // expandable hierarchy: dir → file → symbol. Children are loaded lazily.
 type Tree struct {
 	root  string
+	rev   gitsrc.Revision // filesystem by default; a commit in snapshot mode
 	nodes []*treeNode
 	rows  []*treeNode // flattened, in display order
 }
@@ -30,7 +31,7 @@ type treeNode struct {
 }
 
 func NewTree(root string) (*Tree, error) {
-	t := &Tree{root: root}
+	t := &Tree{root: root, rev: gitsrc.WorkingTree(root)}
 	rootNode := &treeNode{
 		id:       model.NodeID{Kind: model.KindRepo, Path: ""},
 		label:    filepath.Base(root),
@@ -46,6 +47,28 @@ func NewTree(root string) (*Tree, error) {
 }
 
 func (t *Tree) Root() string { return t.root }
+
+// Revision reports the revision the tree is currently reading from.
+func (t *Tree) Revision() gitsrc.Revision { return t.rev }
+
+// SetRevision rebuilds the tree from scratch reading from rev (used to enter
+// or leave a historical snapshot). All expansion/load state is discarded; the
+// caller re-reveals whatever node should be focused afterward.
+func (t *Tree) SetRevision(rev gitsrc.Revision) error {
+	t.rev = rev
+	rootNode := &treeNode{
+		id:       model.NodeID{Kind: model.KindRepo, Path: ""},
+		label:    filepath.Base(t.root),
+		depth:    0,
+		expanded: true,
+	}
+	t.nodes = []*treeNode{rootNode}
+	if err := t.loadChildren(rootNode); err != nil {
+		return err
+	}
+	t.rebuildRows()
+	return nil
+}
 
 func (t *Tree) Rows() []TreeRow {
 	out := make([]TreeRow, len(t.rows))
@@ -103,28 +126,27 @@ func (t *Tree) loadChildren(n *treeNode) error {
 	n.loaded = true
 	switch n.id.Kind {
 	case model.KindRepo, model.KindDir:
-		abs := filepath.Join(t.root, n.id.Path)
-		entries, err := os.ReadDir(abs)
+		entries, err := t.rev.ReadDir(n.id.Path)
 		if err != nil {
 			return err
 		}
-		var dirs, files []os.DirEntry
+		var dirs, files []gitsrc.DirEntry
 		for _, e := range entries {
-			if skipEntry(e.Name()) {
+			if skipEntry(e.Name) {
 				continue
 			}
-			if e.IsDir() {
+			if e.IsDir {
 				dirs = append(dirs, e)
-			} else if !skipFile(e.Name()) {
+			} else if !skipFile(e.Name) {
 				files = append(files, e)
 			}
 		}
-		sort.Slice(dirs, func(i, j int) bool { return dirs[i].Name() < dirs[j].Name() })
-		sort.Slice(files, func(i, j int) bool { return files[i].Name() < files[j].Name() })
+		sort.Slice(dirs, func(i, j int) bool { return dirs[i].Name < dirs[j].Name })
+		sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
 		for _, d := range dirs {
 			child := &treeNode{
-				id:     model.NodeID{Kind: model.KindDir, Path: filepath.Join(n.id.Path, d.Name())},
-				label:  d.Name() + "/",
+				id:     model.NodeID{Kind: model.KindDir, Path: filepath.Join(n.id.Path, d.Name)},
+				label:  d.Name + "/",
 				depth:  n.depth + 1,
 				parent: n,
 			}
@@ -132,15 +154,15 @@ func (t *Tree) loadChildren(n *treeNode) error {
 		}
 		for _, f := range files {
 			child := &treeNode{
-				id:     model.NodeID{Kind: model.KindFile, Path: filepath.Join(n.id.Path, f.Name())},
-				label:  f.Name(),
+				id:     model.NodeID{Kind: model.KindFile, Path: filepath.Join(n.id.Path, f.Name)},
+				label:  f.Name,
 				depth:  n.depth + 1,
 				parent: n,
 			}
 			n.children = append(n.children, child)
 		}
 	case model.KindFile:
-		src, err := os.ReadFile(filepath.Join(t.root, n.id.Path))
+		src, err := t.rev.ReadFile(n.id.Path)
 		if err != nil {
 			return err
 		}

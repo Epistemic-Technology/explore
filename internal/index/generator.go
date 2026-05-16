@@ -14,6 +14,7 @@ import (
 
 	"github.com/mikethicke/explore/internal/cache"
 	"github.com/mikethicke/explore/internal/debug"
+	"github.com/mikethicke/explore/internal/gitsrc"
 	"github.com/mikethicke/explore/internal/llm"
 	"github.com/mikethicke/explore/internal/lsp"
 	"github.com/mikethicke/explore/internal/model"
@@ -28,6 +29,13 @@ type Generator struct {
 	Provider   llm.Provider
 	LSP        *lsp.Pool   // may be nil; per-language clients spawned lazily
 	RepoPrimer string      // README + AGENTS.md, computed once
+
+	// Rev is the revision file reads are served from. Defaults to the live
+	// working tree (byte-identical to the pre-git behavior). Snapshot mode
+	// swaps in a commit-backed revision via AtRevision. The LSP-backed xref
+	// paths deliberately keep reading the working tree — language servers
+	// index on-disk files, not git history.
+	Rev gitsrc.Revision
 
 	// OnUsage is invoked after every successful Provider.Explain call (cache
 	// misses only — cached entries don't bill). May be called from multiple
@@ -99,9 +107,19 @@ func shouldRegenerate(ctx context.Context) bool {
 }
 
 func NewGenerator(root string, c *cache.Cache, p llm.Provider, l *lsp.Pool) *Generator {
-	g := &Generator{Root: root, Cache: c, Provider: p, LSP: l}
+	g := &Generator{Root: root, Cache: c, Provider: p, LSP: l, Rev: gitsrc.WorkingTree(root)}
 	g.RepoPrimer = loadRepoPrimer(root)
 	return g
+}
+
+// AtRevision returns a shallow copy of g that serves file/dir reads from rev,
+// sharing the same cache, provider, and LSP pool. The content-addressed cache
+// means historical content byte-identical to HEAD reuses HEAD's entry for
+// free; only changed files cost an LLM call.
+func (g *Generator) AtRevision(rev gitsrc.Revision) *Generator {
+	cp := *g
+	cp.Rev = rev
+	return &cp
 }
 
 func loadRepoPrimer(root string) string {
@@ -123,7 +141,7 @@ func loadRepoPrimer(root string) string {
 // without going through the LLM.
 func (g *Generator) ParseFile(ctx context.Context, relPath string) (*tsparse.ParsedFile, []byte, error) {
 	abs := filepath.Join(g.Root, relPath)
-	src, err := os.ReadFile(abs)
+	src, err := g.Rev.ReadFile(relPath)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -134,7 +152,7 @@ func (g *Generator) ParseFile(ctx context.Context, relPath string) (*tsparse.Par
 // ExplainFile returns a (possibly cached) explanation for an entire file.
 func (g *Generator) ExplainFile(ctx context.Context, relPath string) (*model.Explanation, error) {
 	absPath := filepath.Join(g.Root, relPath)
-	src, err := os.ReadFile(absPath)
+	src, err := g.Rev.ReadFile(relPath)
 	if err != nil {
 		debug.Logf("ExplainFile: ReadFile err path=%q err=%v", relPath, err)
 		return nil, err
@@ -187,7 +205,7 @@ func (g *Generator) ExplainFile(ctx context.Context, relPath string) (*model.Exp
 // fileSummary is the parent file's prose; passed as priming context.
 func (g *Generator) ExplainSymbol(ctx context.Context, relPath, symbolName, fileSummary string) (*model.Explanation, error) {
 	absPath := filepath.Join(g.Root, relPath)
-	src, err := os.ReadFile(absPath)
+	src, err := g.Rev.ReadFile(relPath)
 	if err != nil {
 		return nil, err
 	}

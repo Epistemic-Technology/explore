@@ -9,7 +9,7 @@ import (
 
 const (
 	helpOverlayW = 76
-	helpOverlayH = 28
+	helpOverlayH = 34
 )
 
 // helpEntry is one row of the cheat sheet.
@@ -28,10 +28,10 @@ var helpSections = []helpSection{
 	{
 		title: "Panes & tabs",
 		entries: []helpEntry{
-			{"Alt+1 / Alt+2 / Alt+3", "focus tree / explanation / source"},
+			{"1 / 2 / 3", "focus tree / explanation / source"},
 			{"Tab / Shift+Tab", "next / previous pane"},
 			{"[ / ]", "previous / next tab within pane"},
-			{"b  or  Ctrl+O", "back in navigation stack"},
+			{"o  or  b  or  Ctrl+O", "back in navigation stack"},
 			{"Ctrl+I", "forward in navigation stack"},
 		},
 	},
@@ -40,7 +40,7 @@ var helpSections = []helpSection{
 		entries: []helpEntry{
 			{"j / k  or  ↓ / ↑", "move cursor"},
 			{"Space  or  l  or  →", "expand / collapse"},
-			{"←", "collapse / climb to parent"},
+			{"h  or  ←", "collapse / climb to parent"},
 			{"Enter", "open in source view"},
 			{"gg / G", "top / bottom"},
 			{"Ngg", "jump to row N"},
@@ -52,13 +52,15 @@ var helpSections = []helpSection{
 			{"j / k", "down / up one line"},
 			{"J / K  or  Ctrl+D / Ctrl+U", "page down / up"},
 			{"gg / G", "first / last line"},
-			{"Ngg", "jump to line N"},
+			{"Ngg  or  :N", "jump to line N"},
+			{"v", "start / stop line selection (extend with j/k, J/K)"},
+			{"x", "explain selection (or current line if no selection)"},
+			{"Esc", "cancel an in-progress selection"},
 		},
 	},
 	{
 		title: "Explanation & Q&A",
 		entries: []helpEntry{
-			{"?", "ask a question about the focused node"},
 			{"i  or  Enter", "start typing in the Q&A input"},
 			{"Esc", "leave the input (shortcuts active); again to close Q&A"},
 			{"Enter (in input)", "send the question"},
@@ -78,9 +80,19 @@ var helpSections = []helpSection{
 		},
 	},
 	{
+		title: "Git history & PRs",
+		entries: []helpEntry{
+			{"H", "open the History tab ([ ] also cycles to it)"},
+			{"P", "open the PRs tab (open + recently-merged)"},
+			{"j / k", "move between commits / PRs (WORKING = uncommitted, at top)"},
+			{"Enter", "enter that commit / PR / WORKING as a diff snapshot"},
+			{"Esc  or  b", "leave the snapshot, back to the working tree"},
+		},
+	},
+	{
 		title: "Global",
 		entries: []helpEntry{
-			{"h", "show this help"},
+			{"?", "show this help"},
 			{"q  or  Ctrl+C", "quit"},
 		},
 	},
@@ -101,7 +113,7 @@ func (m Model) updateHelp(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // underlying view via lipgloss.Place.
 func (m Model) renderHelp(w, h int) string {
 	header := titleStyle.Render("keyboard shortcuts ") + dimStyle.Render("(press any key to close)")
-	footer := dimStyle.Render("h · esc · enter — close")
+	footer := dimStyle.Render("? · esc · enter — close")
 
 	bodyH := h - 4
 	if bodyH < 1 {

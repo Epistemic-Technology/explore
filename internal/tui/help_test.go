@@ -10,11 +10,11 @@ import (
 	"github.com/mikethicke/explore/internal/model"
 )
 
-func TestHelp_HOpensOverlay(t *testing.T) {
+func TestHelp_QuestionMarkOpensOverlay(t *testing.T) {
 	m := Model{}
-	m2, _ := m.updateNav(key('h'))
+	m2, _ := m.updateNav(key('?'))
 	if !m2.(Model).helpOpen {
-		t.Fatalf("expected helpOpen=true after 'h'")
+		t.Fatalf("expected helpOpen=true after '?'")
 	}
 }
 
@@ -149,17 +149,53 @@ func TestStatusHints_HelpOpen(t *testing.T) {
 	}
 }
 
-func TestQuestion_OpenSetsInputActive(t *testing.T) {
+func TestQuestionMark_OpensHelpNotQA(t *testing.T) {
 	m := Model{activePane: paneTree, qa: qaState{inputActive: false}}
 	m2, _ := m.updateNav(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
 	mm := m2.(Model)
-	if !mm.qa.inputActive {
-		t.Errorf("? should activate input")
+	if !mm.helpOpen {
+		t.Errorf("? should open the help overlay")
+	}
+	if mm.qa.inputActive {
+		t.Errorf("? should no longer activate the Q&A input")
+	}
+}
+
+func TestFocusExp_2FromPlainEntersInsertOnNodeQA(t *testing.T) {
+	m := Model{activePane: paneTree, expTab: expTabPlain, qa: qaState{inputActive: false}}
+	m2, _ := m.updateNav(key('2'))
+	mm := m2.(Model)
+	if mm.activePane != paneExp {
+		t.Errorf("'2' should focus explanation pane; activePane=%d", mm.activePane)
 	}
 	if mm.expTab != expTabNodeQA {
-		t.Errorf("? should select node Q&A tab; expTab=%d", mm.expTab)
+		t.Errorf("'2' from Plain should jump to Node Q&A so there is an input; expTab=%d", mm.expTab)
 	}
+	if !mm.qa.inputActive {
+		t.Errorf("'2' should drop into insert mode")
+	}
+}
+
+func TestFocusExp_2OnQATabPreservesTabAndActivatesInput(t *testing.T) {
+	m := Model{activePane: paneTree, expTab: expTabSessionQA, qa: qaState{inputActive: false}}
+	m2, _ := m.updateNav(key('2'))
+	mm := m2.(Model)
+	if mm.expTab != expTabSessionQA {
+		t.Errorf("'2' should keep the existing Q&A tab selection; expTab=%d", mm.expTab)
+	}
+	if !mm.qa.inputActive {
+		t.Errorf("'2' should activate input on Q&A tab")
+	}
+}
+
+func TestFocusExp_TabCyclingActivatesInput(t *testing.T) {
+	m := Model{activePane: paneTree, expTab: expTabPlain, qa: qaState{inputActive: false}}
+	m2, _ := m.updateNav(tea.KeyMsg{Type: tea.KeyTab})
+	mm := m2.(Model)
 	if mm.activePane != paneExp {
-		t.Errorf("? should focus explanation pane; activePane=%d", mm.activePane)
+		t.Fatalf("Tab from tree should land on explanation pane; activePane=%d", mm.activePane)
+	}
+	if !mm.qa.inputActive {
+		t.Errorf("cycling Tab onto explanation pane should drop into insert mode")
 	}
 }

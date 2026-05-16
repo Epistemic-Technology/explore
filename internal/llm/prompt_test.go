@@ -35,3 +35,55 @@ func TestBuildExplainUser_NormalLengthOmitsOutlineInstruction(t *testing.T) {
 		t.Errorf("instruction should be omitted when IsLong=false; got:\n%s", got)
 	}
 }
+
+func TestBuildExplainUser_DiffModeEmitsCommitAndDiff(t *testing.T) {
+	req := ExplainRequest{
+		Level:         LevelCommit,
+		Path:          "abc123",
+		IsDiff:        true,
+		CommitMessage: "fix the bug",
+		Diff:          "@@ -1 +1 @@\n-old\n+new\n",
+		Source:        "should be ignored in diff mode",
+	}
+	got := BuildExplainUser(req)
+	if !strings.Contains(got, "fix the bug") {
+		t.Errorf("expected commit message in prompt; got:\n%s", got)
+	}
+	if !strings.Contains(got, "+new") || !strings.Contains(got, "```diff") {
+		t.Errorf("expected fenced diff in prompt; got:\n%s", got)
+	}
+	if !strings.Contains(got, "what this change does and why") {
+		t.Errorf("expected change-explanation instruction; got:\n%s", got)
+	}
+	if strings.Contains(got, "should be ignored in diff mode") {
+		t.Errorf("diff mode must not emit the Source block; got:\n%s", got)
+	}
+}
+
+func TestBuildExplainUser_PRModeEmitsReviewFraming(t *testing.T) {
+	req := ExplainRequest{
+		Level:   LevelPR,
+		Path:    "PR #42",
+		IsPR:    true,
+		PRTitle: "Add retry to the uploader",
+		PRBody:  "Fixes flaky uploads.",
+		Diff:    "@@ -1 +1 @@\n-old\n+new\n",
+		Source:  "should be ignored in PR mode",
+	}
+	got := BuildExplainUser(req)
+	if !strings.Contains(got, "Add retry to the uploader") || !strings.Contains(got, "Fixes flaky uploads.") {
+		t.Errorf("expected PR title+body in prompt; got:\n%s", got)
+	}
+	if !strings.Contains(got, "+new") || !strings.Contains(got, "```diff") {
+		t.Errorf("expected fenced diff in prompt; got:\n%s", got)
+	}
+	if !strings.Contains(got, "Review this pull request") {
+		t.Errorf("expected reviewer framing, not the neutral commit framing; got:\n%s", got)
+	}
+	if strings.Contains(got, "what this change does and why") {
+		t.Errorf("PR mode must use review framing, not the commit-diff instruction; got:\n%s", got)
+	}
+	if strings.Contains(got, "should be ignored in PR mode") {
+		t.Errorf("PR mode must not emit the Source block; got:\n%s", got)
+	}
+}

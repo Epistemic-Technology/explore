@@ -36,6 +36,22 @@ func BuildExplainUser(req ExplainRequest) string {
 	if req.Symbol != "" {
 		fmt.Fprintf(&b, "Symbol: %s\n", req.Symbol)
 	}
+	if req.IsPR {
+		fmt.Fprintf(&b, "\nPull request: %s\n", strings.TrimSpace(req.PRTitle))
+		if body := strings.TrimSpace(req.PRBody); body != "" {
+			fmt.Fprintf(&b, "\nDescription:\n%s\n", body)
+		}
+		b.WriteString("\nDiff (unified, head vs. base):\n```diff\n")
+		b.WriteString(req.Diff)
+		b.WriteString("\n```\n")
+		b.WriteString("\nReview this pull request as an experienced reviewer would. " +
+			"In `prose`: lead with what the PR is trying to accomplish, then assess the approach — " +
+			"correctness concerns, edge cases or inputs that look unhandled, and anything that warrants closer scrutiny before merge. " +
+			"Use `key_types` for the symbols/files a reviewer should read first and `gotchas` for concrete risks, " +
+			"missing test coverage, or behavioral/compatibility hazards introduced. Be specific and grounded in the diff; " +
+			"do not invent issues if the change is sound — say so. Return only the JSON object described in the system prompt.")
+		return b.String()
+	}
 	if req.IsDiff {
 		if req.CommitMessage != "" {
 			fmt.Fprintf(&b, "\nCommit message:\n%s\n", strings.TrimSpace(req.CommitMessage))

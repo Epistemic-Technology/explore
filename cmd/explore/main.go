@@ -13,6 +13,7 @@ import (
 	"github.com/mikethicke/explore/internal/cache"
 	"github.com/mikethicke/explore/internal/config"
 	"github.com/mikethicke/explore/internal/debug"
+	"github.com/mikethicke/explore/internal/ghsrc"
 	"github.com/mikethicke/explore/internal/gitsrc"
 	"github.com/mikethicke/explore/internal/index"
 	"github.com/mikethicke/explore/internal/llm"
@@ -182,7 +183,11 @@ func main() {
 	// repo is nil when not a git repo / git missing — History degrades off.
 	repo, isGit := gitsrc.Open(absRoot)
 	debug.Logf("startup: git repo=%v", isGit)
-	m := tui.NewModel(gen, tree, prefetcher, cfg.UI.TokenBudget, repo)
+	// gh is nil when not a GitHub repo / gh missing / unauthenticated — the
+	// PRs tab degrades off, same contract as History.
+	ghRepo, isGH := ghsrc.Open(absRoot)
+	debug.Logf("startup: github repo=%v", isGH)
+	m := tui.NewModel(gen, tree, prefetcher, cfg.UI.TokenBudget, repo, ghRepo)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fatal(err)

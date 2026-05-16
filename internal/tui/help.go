@@ -80,11 +80,12 @@ var helpSections = []helpSection{
 		},
 	},
 	{
-		title: "Git history",
+		title: "Git history & PRs",
 		entries: []helpEntry{
 			{"H", "open the History tab ([ ] also cycles to it)"},
-			{"j / k", "move between commits (WORKING = uncommitted, at top)"},
-			{"Enter", "enter that commit / WORKING as a diff snapshot"},
+			{"P", "open the PRs tab (open + recently-merged)"},
+			{"j / k", "move between commits / PRs (WORKING = uncommitted, at top)"},
+			{"Enter", "enter that commit / PR / WORKING as a diff snapshot"},
 			{"Esc  or  b", "leave the snapshot, back to the working tree"},
 		},
 	},

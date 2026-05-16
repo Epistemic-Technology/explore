@@ -25,8 +25,18 @@ import (
 const workingRef = "\x00WORKING"
 
 // currentRev is the logical revision driving diff mode ("" live, workingRef
-// for working-vs-HEAD, else a commit sha).
+// for working-vs-HEAD, else a commit sha or a PR head ref).
 func (m Model) currentRev() string { return m.rev }
+
+// diffParent is the baseline the active snapshot is diffed against: the
+// explicit diffBase when set (PR merge-base), else the commit's first parent.
+// Only meaningful for a real commit/PR snapshot, not the working diff.
+func (m Model) diffParent() string {
+	if m.diffBase != "" {
+		return m.diffBase
+	}
+	return m.currentRev() + "^"
+}
 
 // inSnapshot reports whether a diff overlay is active (a historical commit OR
 // the working-vs-HEAD view). Used to gate all diff UI.
@@ -64,6 +74,9 @@ func (m *Model) applyRevision(ref string) error {
 		return err
 	}
 	m.rev = ref
+	// A PR snapshot diffs against its merge-base; a plain commit/working diff
+	// has no entry here and falls back to the first-parent default.
+	m.diffBase = m.prBaseFor[ref]
 	m.expCache = make(map[model.NodeID]*model.Explanation)
 	m.sourceCache = make(map[string]string)
 	m.parsedCache = make(map[string]*tsparse.ParsedFile)
@@ -111,6 +124,7 @@ func (m *Model) ensureSymChanges(path string) tea.Cmd {
 	}
 	m.loadingSym[path] = true
 	repo, sha := m.repo, m.currentRev()
+	parentRef := m.diffParent()
 	added := st != "" && st[0] == 'A'
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), gitOpTimeout)
@@ -118,7 +132,7 @@ func (m *Model) ensureSymChanges(path string) tea.Cmd {
 		// "cur" is the file at the commit, or the working copy in working
 		// mode; "par" is the baseline it's diffed against (sha^ or HEAD).
 		curRev := repo.AtCommit(sha)
-		parRef := sha + "^"
+		parRef := parentRef
 		if sha == workingRef {
 			curRev = repo.WorkingTree()
 			parRef = "HEAD"
@@ -252,14 +266,18 @@ type fileDiffMsg struct {
 // first parent, used to color the snapshot tree.
 func (m *Model) loadChangesCmd(sha string) tea.Cmd {
 	repo := m.repo
+	base := m.diffBase
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), gitOpTimeout)
 		defer cancel()
 		var fcs []gitsrc.FileChange
 		var err error
-		if sha == workingRef {
+		switch {
+		case sha == workingRef:
 			fcs, err = repo.WorkingChanges(ctx)
-		} else {
+		case base != "":
+			fcs, err = repo.RangeChanges(ctx, base, sha)
+		default:
 			var d gitsrc.CommitDetail
 			d, err = repo.CommitMeta(ctx, sha)
 			fcs = d.Changes
@@ -355,12 +373,14 @@ func (m *Model) maybeLoadFileDiff() tea.Cmd {
 	}
 	m.loadingDiff[path] = true
 	repo, sha := m.repo, m.currentRev()
+	base := m.diffBase
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), gitOpTimeout)
 		defer cancel()
 		var b []byte
 		var err error
-		if sha == workingRef {
+		switch {
+		case sha == workingRef:
 			b, err = repo.WorkingFileDiff(ctx, path)
 			if err == nil && strings.TrimSpace(string(b)) == "" {
 				// Untracked file: git diff is empty. Synthesize an all-added
@@ -369,7 +389,9 @@ func (m *Model) maybeLoadFileDiff() tea.Cmd {
 					b = []byte(synthAllAdded(src))
 				}
 			}
-		} else {
+		case base != "":
+			b, err = repo.RangeFileDiff(ctx, base, sha, path)
+		default:
 			b, err = repo.FileDiff(ctx, sha, path)
 		}
 		if err != nil {

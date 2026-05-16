@@ -12,6 +12,7 @@ const (
 	LevelFile   Level = "file"
 	LevelSymbol Level = "symbol"
 	LevelCommit Level = "commit"
+	LevelPR     Level = "pr"
 )
 
 // ExplainRequest carries everything a provider needs to produce a structured
@@ -57,6 +58,15 @@ type ExplainRequest struct {
 	IsDiff        bool
 	CommitMessage string
 	Diff          string
+
+	// IsPR marks a pull-request review request. It implies a diff (Diff +
+	// PRTitle/PRBody are emitted) but BuildExplainUser frames the output as a
+	// reviewer's read — risks, what to scrutinize, test gaps — rather than the
+	// neutral "what changed and why" of a commit. Same JSON schema; providers
+	// need no special handling.
+	IsPR    bool
+	PRTitle string
+	PRBody  string
 }
 
 type Explanation struct {

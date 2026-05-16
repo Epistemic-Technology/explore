@@ -16,6 +16,7 @@ import (
 const (
 	treeTabTree    = 0
 	treeTabHistory = 1
+	treeTabPRs     = 2
 )
 
 // gitOpTimeout bounds a single git invocation. Local repos answer in

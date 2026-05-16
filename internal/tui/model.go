@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/mikethicke/explore/internal/debug"
+	"github.com/mikethicke/explore/internal/ghsrc"
 	"github.com/mikethicke/explore/internal/gitsrc"
 	"github.com/mikethicke/explore/internal/highlight"
 	"github.com/mikethicke/explore/internal/index"
@@ -50,7 +51,7 @@ const (
 )
 
 var paneTabs = map[int][]string{
-	paneTree: {"Tree", "History"},
+	paneTree: {"Tree", "History", "PRs"},
 	paneExp:  {"Explanation", "Q&A (node)", "Q&A (session)"},
 	paneSrc:  {"Source"},
 }
@@ -93,6 +94,18 @@ type Model struct {
 	// snapshot, "" when on the live working tree. Drives the status banner.
 	snapshotDesc string
 
+	// diffBase is the explicit revision the active snapshot is diffed against.
+	// "" means "use the default" (a commit's first parent, sha^); a PR
+	// snapshot sets it to the merge-base so multi-commit PRs show their
+	// cumulative change. applyRevision repopulates it from prBaseFor on every
+	// revision switch so back/forward into a PR frame stays correct without
+	// widening the nav stack.
+	diffBase string
+
+	// prBaseFor maps a snapshot revision (a PR head ref) to its merge-base
+	// diff base. Commits are absent here and fall back to sha^.
+	prBaseFor map[string]string
+
 	// Diff overlay state for snapshot mode. snapshotChanges maps a
 	// repo-relative path to its name-status vs. the commit's first parent
 	// (A/M/D/R…); it drives tree coloring. snapshotDiff caches per-file
@@ -115,10 +128,16 @@ type Model struct {
 	snapshotSymChanges map[string]map[string]string
 	loadingSym         map[string]bool
 
-	// treeTab selects the tree pane's tab (Tree / History). history holds the
-	// commit list + per-commit detail cache for the History tab.
+	// gh is nil when the root is not a usable GitHub repo (gh missing,
+	// unauthenticated, or no GitHub remote); the PRs tab degrades off,
+	// mirroring missing-LSP / non-git.
+	gh *ghsrc.Repo
+
+	// treeTab selects the tree pane's tab (Tree / History / PRs). history /
+	// prs hold the per-tab list + caches.
 	treeTab int
 	history historyUI
+	prs     prUI
 
 	width, height int
 
@@ -273,7 +292,7 @@ func (q *qaState) streamVisible(mode string, id model.NodeID) bool {
 	return true
 }
 
-func NewModel(gen *index.Generator, tree *Tree, prefetcher *index.Prefetcher, tokenBudget int, repo *gitsrc.Repo) Model {
+func NewModel(gen *index.Generator, tree *Tree, prefetcher *index.Prefetcher, tokenBudget int, repo *gitsrc.Repo, gh *ghsrc.Repo) Model {
 	hl, err := highlight.New()
 	if err != nil {
 		// A query compile error here is a programmer bug, but we don't want
@@ -315,7 +334,10 @@ func NewModel(gen *index.Generator, tree *Tree, prefetcher *index.Prefetcher, to
 		tokenBudget: tokenBudget,
 		highlighter: hl,
 		repo:        repo,
+		gh:          gh,
 		history:     newHistoryUI(),
+		prs:         newPRUI(),
+		prBaseFor:   map[string]string{},
 	}
 	if rows := tree.Rows(); len(rows) > 0 {
 		m.cursor = 0
@@ -910,6 +932,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case commitExplainMsg:
 		return m.handleCommitExplainMsg(msg)
 
+	case prListMsg:
+		return m.handlePRListMsg(msg)
+
+	case prDetailMsg:
+		return m.handlePRDetailMsg(msg)
+
+	case prDiffMsg:
+		return m.handlePRDiffMsg(msg)
+
+	case prExplainMsg:
+		return m.handlePRExplainMsg(msg)
+
+	case prSnapshotReadyMsg:
+		return m.handlePRSnapshotReadyMsg(msg)
+
 	case commitChangesMsg:
 		return m.handleCommitChangesMsg(msg)
 
@@ -1032,11 +1069,11 @@ func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "]":
 		m.cycleTab(1)
 		m.resetVim()
-		return m, m.ensureHistoryLoaded()
+		return m, m.ensureActiveTabLoaded()
 	case "[":
 		m.cycleTab(-1)
 		m.resetVim()
-		return m, m.ensureHistoryLoaded()
+		return m, m.ensureActiveTabLoaded()
 	case "o", "b", "ctrl+o":
 		m.resetVim()
 		if id, ok := m.stack.Back(); ok {
@@ -1067,6 +1104,9 @@ func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "H":
 		m.resetVim()
 		return m, m.openHistory()
+	case "P":
+		m.resetVim()
+		return m, m.openPRs()
 	case "u":
 		m.resetVim()
 		return m.openCallersOf()
@@ -1370,9 +1410,24 @@ func (m *Model) enterExpPane() {
 	m.qa.inputActive = true
 }
 
+// ensureActiveTabLoaded triggers the lazy load for whichever tree-pane tab is
+// now active after a tab switch. The Tree tab needs no load.
+func (m *Model) ensureActiveTabLoaded() tea.Cmd {
+	switch m.treeTab {
+	case treeTabHistory:
+		return m.ensureHistoryLoaded()
+	case treeTabPRs:
+		return m.ensurePRsLoaded()
+	}
+	return nil
+}
+
 func (m Model) updateTreePane(s string) (tea.Model, tea.Cmd) {
 	if m.treeTab == treeTabHistory {
 		return m.updateHistoryPane(s)
+	}
+	if m.treeTab == treeTabPRs {
+		return m.updatePRsPane(s)
 	}
 	rows := m.tree.Rows()
 	switch s {
@@ -1988,6 +2043,9 @@ func (m Model) renderTree(w, h int) string {
 	if m.treeTab == treeTabHistory {
 		return m.renderHistory(w, h)
 	}
+	if m.treeTab == treeTabPRs {
+		return m.renderPRList(w, h)
+	}
 	rows := m.tree.Rows()
 	if h < 1 || len(rows) == 0 {
 		return ""
@@ -2027,6 +2085,9 @@ func (m Model) renderExp(w, h int) string {
 	}
 	if m.treeTab == treeTabHistory {
 		return m.renderCommitExplain(w, h)
+	}
+	if m.treeTab == treeTabPRs {
+		return m.renderPRExplain(w, h)
 	}
 	if m.inSnapshot() && m.currentFile != "" && m.changeStatus(m.currentFile) != "" {
 		return m.renderNodeChangeExplain(w, h)
@@ -2074,6 +2135,9 @@ func (m Model) renderExp(w, h int) string {
 func (m Model) renderSource(w, h int) string {
 	if m.treeTab == treeTabHistory {
 		return m.renderCommitDetail(w, h)
+	}
+	if m.treeTab == treeTabPRs {
+		return m.renderPRDetail(w, h)
 	}
 	if m.inDiffView() {
 		return m.renderDiffView(w, h)

@@ -2,6 +2,7 @@ package index
 
 import (
 	"context"
+	"strconv"
 	"time"
 
 	"github.com/mikethicke/explore/internal/cache"
@@ -59,6 +60,59 @@ func (g *Generator) ExplainCommit(ctx context.Context, sha, commitMsg, diff stri
 			Gotchas:  llmExp.Metadata.Gotchas,
 		},
 		SourceHash: cache.HashSource([]byte(sha)),
+		Model:      g.Provider.Model(),
+		PromptVer:  cache.PromptVersion,
+		CreatedAt:  time.Now(),
+	}
+	_ = g.Cache.Put(key, exp)
+	return exp, nil
+}
+
+// ExplainPR produces a reviewer-focused explanation for a pull request:
+// what it is trying to do, plus risks / what to scrutinize / test gaps,
+// grounded in the PR title+body and its full head-vs-base diff. Cached by
+// sha256(number+"\n"+title+"\n"+body+"\n"+diff) under the "prreview" level —
+// content-addressed, so a force-push that rewrites the PR diff naturally
+// invalidates the entry. Mirrors ExplainCommit; decoupled from ghsrc the same
+// way (the caller passes title/body/diff in).
+func (g *Generator) ExplainPR(ctx context.Context, number int, title, body, diff string) (*model.Explanation, error) {
+	id := strconv.Itoa(number)
+	key := cache.Key(cache.HashSource([]byte(id+"\n"+title+"\n"+body+"\n"+diff)), "prreview", g.Provider.Model(), cache.PromptVersion)
+	if !shouldRegenerate(ctx) {
+		if hit, _ := g.Cache.Get(key); hit != nil {
+			debug.Logf("ExplainPR: cache hit pr=%s", id)
+			return hit, nil
+		}
+	}
+	debug.Logf("ExplainPR: cache miss pr=%s diffLen=%d regen=%v", id, len(diff), shouldRegenerate(ctx))
+
+	promptDiff := diff
+	if len(promptDiff) > commitDiffPromptCap {
+		promptDiff = promptDiff[:commitDiffPromptCap] + "\n... [diff truncated]"
+	}
+	req := llm.ExplainRequest{
+		Level:      llm.LevelPR,
+		Path:       "PR #" + id,
+		IsPR:       true,
+		PRTitle:    title,
+		PRBody:     body,
+		Diff:       promptDiff,
+		RepoPrimer: g.RepoPrimer,
+	}
+	g.reportSecrets(title + "\n" + body + "\n" + promptDiff)
+	llmExp, err := g.Provider.Explain(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	g.reportUsage(llmExp.Usage)
+	exp := &model.Explanation{
+		NodeID: model.NodeID{Kind: model.KindRepo, Path: "pr:" + id},
+		Prose:  llmExp.Prose,
+		Metadata: model.Metadata{
+			KeyTypes: llmExp.Metadata.KeyTypes,
+			Gotchas:  llmExp.Metadata.Gotchas,
+		},
+		SourceHash: cache.HashSource([]byte(id)),
 		Model:      g.Provider.Model(),
 		PromptVer:  cache.PromptVersion,
 		CreatedAt:  time.Now(),

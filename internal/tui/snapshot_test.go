@@ -52,7 +52,7 @@ func TestEnterExitSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := NewModel(gen, tree, nil, 0, repo)
+	m := NewModel(gen, tree, nil, 0, repo, nil)
 
 	// Working tree shows the uncommitted file.
 	if m.tree.FindRow(model.NodeID{Kind: model.KindFile, Path: "wip.go"}) < 0 {
@@ -124,7 +124,7 @@ func TestBackForwardCrossesRevisionBoundary(t *testing.T) {
 	t.Cleanup(func() { c.Close() })
 	gen := index.NewGenerator(root, c, nopProvider{}, nil)
 	tree, _ := NewTree(root)
-	m := NewModel(gen, tree, nil, 0, repo)
+	m := NewModel(gen, tree, nil, 0, repo, nil)
 
 	_ = m.openHistory()
 	lm := m.loadHistoryCmd()().(gitLogMsg)
@@ -158,7 +158,7 @@ func TestSnapshotDiffColoringAndView(t *testing.T) {
 	t.Cleanup(func() { c.Close() })
 	gen := index.NewGenerator(root, c, nopProvider{}, nil)
 	tree, _ := NewTree(root)
-	m := NewModel(gen, tree, nil, 0, repo)
+	m := NewModel(gen, tree, nil, 0, repo, nil)
 
 	_ = m.openHistory()
 	lm := m.loadHistoryCmd()().(gitLogMsg)
@@ -249,7 +249,7 @@ func TestSnapshotDirAggregateColor(t *testing.T) {
 	t.Cleanup(func() { c.Close() })
 	gen := index.NewGenerator(root, c, nopProvider{}, nil)
 	tree, _ := NewTree(root)
-	m := NewModel(gen, tree, nil, 0, repo)
+	m := NewModel(gen, tree, nil, 0, repo, nil)
 	_ = m.openHistory()
 	lm := m.loadHistoryCmd()().(gitLogMsg)
 	mi, _ := m.handleGitLogMsg(lm)
@@ -299,7 +299,7 @@ func TestSnapshotNodeChangeExplain(t *testing.T) {
 	t.Cleanup(func() { c.Close() })
 	gen := index.NewGenerator(root, c, nopProvider{}, nil)
 	tree, _ := NewTree(root)
-	m := NewModel(gen, tree, nil, 0, repo)
+	m := NewModel(gen, tree, nil, 0, repo, nil)
 
 	_ = m.openHistory()
 	lm := m.loadHistoryCmd()().(gitLogMsg)
@@ -386,7 +386,7 @@ func TestInlineDiffFullFileView(t *testing.T) {
 	t.Cleanup(func() { c.Close() })
 	gen := index.NewGenerator(root, c, nopProvider{}, nil)
 	tree, _ := NewTree(root)
-	m := NewModel(gen, tree, nil, 0, repo)
+	m := NewModel(gen, tree, nil, 0, repo, nil)
 
 	_ = m.openHistory()
 	lm := m.loadHistoryCmd()().(gitLogMsg)
@@ -438,7 +438,7 @@ func TestWorkingDiffMode(t *testing.T) {
 	t.Cleanup(func() { c.Close() })
 	gen := index.NewGenerator(root, c, nopProvider{}, nil)
 	tree, _ := NewTree(root)
-	m := NewModel(gen, tree, nil, 0, repo)
+	m := NewModel(gen, tree, nil, 0, repo, nil)
 
 	_ = m.openHistory()
 	lm := m.loadHistoryCmd()().(gitLogMsg)

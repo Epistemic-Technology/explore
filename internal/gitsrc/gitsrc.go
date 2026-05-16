@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // DirEntry is the minimal directory-entry shape the tree/index layers need.
@@ -97,9 +98,25 @@ func (r *Repo) AtCommit(sha string) Revision { return commitRev{repo: r, sha: sh
 // process, which is correct here: every git invocation is one-shot and
 // request-scoped — this is NOT the long-lived-process case the LSP-lifetime
 // rule guards against.
+//
+// Network ops (fetch) run `git`, which spawns `ssh` as a *grandchild*. Killing
+// git on ctx cancel leaves ssh holding the stdout/stderr pipe, so cmd.Wait
+// would block forever — a permanently wedged TUI. Two guards: WaitDelay forces
+// Wait to return shortly after the kill even with a lingering grandchild, and
+// the env makes auth fail fast (non-interactive) instead of blocking on a
+// passphrase/host-key prompt the alt-screen TUI can never satisfy. Local ops
+// (log/show/diff) never spawn ssh, so this is inert for them.
 func (r *Repo) git(ctx context.Context, args ...string) ([]byte, error) {
 	full := append([]string{"-C", r.root}, args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
+	cmd.WaitDelay = 5 * time.Second
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if os.Getenv("GIT_SSH_COMMAND") == "" {
+		// Only impose our own ssh hardening if the user hasn't configured
+		// theirs — respect a custom GIT_SSH_COMMAND if present.
+		cmd.Env = append(cmd.Env,
+			"GIT_SSH_COMMAND=ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new")
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

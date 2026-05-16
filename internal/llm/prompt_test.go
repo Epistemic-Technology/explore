@@ -59,3 +59,31 @@ func TestBuildExplainUser_DiffModeEmitsCommitAndDiff(t *testing.T) {
 		t.Errorf("diff mode must not emit the Source block; got:\n%s", got)
 	}
 }
+
+func TestBuildExplainUser_PRModeEmitsReviewFraming(t *testing.T) {
+	req := ExplainRequest{
+		Level:   LevelPR,
+		Path:    "PR #42",
+		IsPR:    true,
+		PRTitle: "Add retry to the uploader",
+		PRBody:  "Fixes flaky uploads.",
+		Diff:    "@@ -1 +1 @@\n-old\n+new\n",
+		Source:  "should be ignored in PR mode",
+	}
+	got := BuildExplainUser(req)
+	if !strings.Contains(got, "Add retry to the uploader") || !strings.Contains(got, "Fixes flaky uploads.") {
+		t.Errorf("expected PR title+body in prompt; got:\n%s", got)
+	}
+	if !strings.Contains(got, "+new") || !strings.Contains(got, "```diff") {
+		t.Errorf("expected fenced diff in prompt; got:\n%s", got)
+	}
+	if !strings.Contains(got, "Review this pull request") {
+		t.Errorf("expected reviewer framing, not the neutral commit framing; got:\n%s", got)
+	}
+	if strings.Contains(got, "what this change does and why") {
+		t.Errorf("PR mode must use review framing, not the commit-diff instruction; got:\n%s", got)
+	}
+	if strings.Contains(got, "should be ignored in PR mode") {
+		t.Errorf("PR mode must not emit the Source block; got:\n%s", got)
+	}
+}

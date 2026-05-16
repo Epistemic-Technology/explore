@@ -13,6 +13,7 @@ import (
 	"github.com/mikethicke/explore/internal/cache"
 	"github.com/mikethicke/explore/internal/config"
 	"github.com/mikethicke/explore/internal/debug"
+	"github.com/mikethicke/explore/internal/gitsrc"
 	"github.com/mikethicke/explore/internal/index"
 	"github.com/mikethicke/explore/internal/llm"
 	"github.com/mikethicke/explore/internal/llm/claude"
@@ -178,7 +179,10 @@ func main() {
 	}
 	prefetcher := index.NewPrefetcher(gen, 0) // 0 → default concurrency (3)
 	defer prefetcher.Close()
-	m := tui.NewModel(gen, tree, prefetcher, cfg.UI.TokenBudget)
+	// repo is nil when not a git repo / git missing — History degrades off.
+	repo, isGit := gitsrc.Open(absRoot)
+	debug.Logf("startup: git repo=%v", isGit)
+	m := tui.NewModel(gen, tree, prefetcher, cfg.UI.TokenBudget, repo)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fatal(err)

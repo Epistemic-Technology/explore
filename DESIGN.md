@@ -191,10 +191,114 @@ type Metadata struct {
 **v0.5**
 - `u` / `d` xref navigation (callers / callees, picker when >1), `e` open in `$EDITOR`, `y` yank (path / explanation / source), secret-scan warn before LLM calls (gitleaks-style, never auto-redact), symbol-level granularity for long (>200 LOC) functions.
 
-**v0.6 — git integration**
-- Commit history view for the focused node (repo / dir / file / symbol), scoped by `git log -- <path>` (symbol scope uses `git log -L` or line-range follow).
-- Diff view per commit (unified, syntax-highlighted via the existing `internal/highlight` pipeline).
-- LLM-generated explanations of *changes* in a commit: what changed, why (commit message + diff as context), and which symbols are affected. Cached by `sha256(commit_sha + diff + prompt_version + model_id)` so re-viewing is free.
+**v0.6 — git integration** (full design in [Git integration](#git-integration-v06))
+- History tab on the tree pane: the full commit history of the current branch (`git log`), not scoped to the focused node.
+- Highlighting a commit shows its message + changed-file stat in the source pane and a change-focused AI explanation in the explanation pane.
+- `Enter` on a commit enters a **full historical snapshot**: the whole tree/source/explanations reflect the repo as it existed at that commit (read from git objects, never the working tree), with diff coloring (vs the commit's first parent) overlaid. `b`/`Esc` returns to the live HEAD view.
+- Diff view per changed node (unified, syntax-highlighted via the existing `internal/highlight` pipeline).
+- LLM explanations of *changes*, cached by `sha256(commit_sha + diff + prompt_version + model_id)` so re-viewing is free.
+
+## Git integration (v0.6)
+
+### Goals
+
+Let the reader answer "how did this get to be the way it is?" without leaving the tool. Two confirmed product decisions shape everything below:
+
+1. **Diff baseline = commit vs. its first parent.** Colors, diffs, and change explanations describe what *that commit itself* changed (`<sha>^..<sha>`). The history view is about understanding individual commits, not cumulative drift.
+2. **`Enter` = full historical snapshot.** The entire tree/source/explanation stack reflects the repo *as it existed at that commit*, parsed from git objects. Diff coloring is overlaid on that snapshot. This is a whole-app mode, not a side panel.
+
+### Key enabling property: the cache is content-addressed
+
+Cache keys are `sha256(source) | level | promptver | model`. A historical file whose bytes are identical to HEAD hashes identically, so **browsing unchanged historical code is free** — it cache-hits the same entry HEAD already produced. Only files a commit actually touched cost an LLM call. The design preserves this: historical "normal" explanations go through the *existing* `ExplainFile`/`ExplainSymbol` path, just fed different bytes. No new cache plumbing for the snapshot case.
+
+### Core abstraction: a revision-scoped file source
+
+Everything that currently does `os.ReadFile(filepath.Join(root, rel))` or walks the filesystem must instead go through a revision. New leaf package `internal/gitsrc` (imports `model` + stdlib + `os/exec` only — obeys the no-import-cycle rule; `index` and `tui` may import it, it imports neither):
+
+```go
+package gitsrc
+
+type Repo struct { root string }
+func Open(root string) (*Repo, bool)   // false: not a git repo / no git binary → feature hidden
+
+type Revision interface {
+    Ref() string                        // "" = working tree; else commit sha
+    ReadFile(rel string) ([]byte, error)
+    Tree() ([]Entry, error)             // tracked files/dirs at this revision
+}
+```
+
+Two implementations:
+
+- **`workingTree`** — delegates to the filesystem. This is the default and reproduces today's behavior byte-for-byte, so live mode carries zero regression risk.
+- **`commitRev{sha}`** — `git ls-tree -r --name-only <sha>` for `Tree()`, `git show <sha>:<rel>` for `ReadFile`. No checkout, no working-tree mutation (honors the read-only promise).
+
+`Generator` gains a `Rev Revision` field (defaults to `workingTree`). The four `ExplainX` methods and `ParseFile` read through `g.Rev`. `tsparse.Parse(ctx, absPath, src)` already takes bytes and only uses the path for extension-based language detection, so historical parsing works unchanged. The TUI's `Tree` gains a pluggable lister backed by the same `Revision` (filesystem by default).
+
+### Git CLI, not a library
+
+Shell out to `git` via `exec.Command`. No new heavy dependency; a git feature can assume `git` is present, and missing-git degrades gracefully (History tab hidden) exactly like missing-LSP. Note on the [[project-lsp-lifetime]] rule: that rule forbids `exec.CommandContext` only for *long-lived* processes meant to outlive a request. `git log`/`git show`/`git diff` are one-shot and request-scoped — using `CommandContext` for them is correct and gives free cancellation when the user navigates away mid-load.
+
+### UI: History tab on the tree pane
+
+`paneTabs[paneTree]` becomes `["Tree", "History"]`, so `[`/`]` cycles it when the tree pane is focused; a dedicated `H` key jumps straight to it. The History tab lists the **full commit history of the current branch** (`git log`, capped) — it is deliberately *not* scoped to the focused node. The list loads once and never reloads on navigation; the header shows the branch name (`git rev-parse --abbrev-ref HEAD`).
+
+A synthetic **WORKING** row sits at the top of the list, representing the uncommitted state (working tree vs. HEAD, including untracked files as additions). It behaves exactly like a commit whose parent is HEAD: highlighting it shows the changed-file list + an AI explanation of the uncommitted changes; `Enter` enters a diff overlay on the *live* working tree (colored tree + full-file inline diffs vs. HEAD). Internally it's the sentinel logical revision `workingRef` (`m.rev`); `inSnapshot()` is true (diff UI active) but `atCommitSnapshot()` is false, so LSP xref and the prefetcher stay enabled (they correctly operate on the working tree). The data-source layer special-cases `workingRef` to use `git diff HEAD` / `WorkingChanges` / `WorkingFileDiff` instead of the commit-vs-parent commands; untracked files have no `git diff`, so their inline view is synthesized as an all-added patch from the file contents.
+
+```go
+type Commit struct {
+    SHA, ShortSHA, Subject, Author string
+    AuthorDate time.Time
+}
+```
+
+Loaded async with the existing debounced-load + spinner pattern (`gitLogMsg`). Capped at ~300 commits for v0.6; pagination deferred.
+
+**Highlighting** a commit (j/k): source pane shows the commit message + `git show --stat` changed-file list; explanation pane shows the commit-level change explanation.
+
+**`Enter`** on a commit: set `m.rev = commitRev{sha}`, rebuild the tree from that revision, switch to the Tree tab, render a status banner (`@ ab12cd (historical) — b to return`). Diff coloring overlaid (below).
+
+### Diff coloring
+
+On entering a snapshot at commit `C` (parent `P = C^`), compute `git diff --name-status P C` once → `map[rel]status`. The historical tree = `ls-tree` at `C` **plus** files deleted by `C` shown as red, non-navigable tombstones (so the user can still see what was removed). Per-row color (new fg style in `theme.go`, applied in `renderTree`, composed under the existing cursor `selectedStyle` background):
+
+- file: added → green, modified → yellow, deleted → red, untouched → normal
+- dir: aggregate of descendants — all-added green, all-deleted red, any-changed yellow, else normal
+
+**Symbol-level coloring** (the "if possible" stretch): for a modified file, parse `P` and `C` versions, match symbols by `(Receiver, Name, Kind)`. Only in `C` → green; only in `P` → red tombstone child; in both with different source slice → yellow; identical → normal. Pure function over two `ParsedFile`s; behind a best-effort gate (skip silently if either parse fails). First thing to cut if it destabilizes.
+
+### Diff view in the source pane
+
+When in a snapshot and the focused node is a changed file/symbol, the source pane renders a unified diff (`git diff P C -- <path>`, scrolled to the symbol's hunk for symbol nodes) instead of plain source. Renderer is a variant of `renderSource`: parse hunks, apply new `diffAddStyle`/`diffDelStyle`/`diffHunkStyle` backgrounds, and still run the `internal/highlight` syntax spans over each line's content. An *unchanged* node in snapshot mode renders its historical source normally (syntax-highlighted, no diff) — that is the "full snapshot" requirement.
+
+### Change-focused explanations
+
+Mirror the `IsLong` precedent exactly (it's the established low-risk pattern: extra `ExplainRequest` fields + a `BuildExplainUser` branch, providers untouched, distinct cache level). Add to `llm.ExplainRequest`: `IsDiff bool`, `CommitMessage string`, `Diff string`. When `IsDiff`, `BuildExplainUser` emits the commit message + diff and instructs "explain what changed and why," still returning the same JSON schema. Two entry points on `Generator`:
+
+- `ExplainCommit(ctx, sha)` — commit-level (shown when a commit is highlighted). Context = message + `--stat` + truncated full diff (reuse the 12 KB-style cutoff with a "diff truncated" note). Cache: `Key(HashSource(sha+"\n"+diff), "commit", model, promptver)` — the DESIGN'd `sha256(commit_sha+diff)` key, no `Cache` changes.
+- `ExplainChange(ctx, rev, nodeID)` — per-node diff explanation in snapshot mode, cache level `"filediff"`/`"symboldiff"`, content-addressed on the node's diff text. Unchanged nodes fall through to the normal `ExplainFile`/`ExplainSymbol` path (free via the content-hash hit described above).
+
+### Navigation across the live↔historical boundary
+
+`nav.Stack` currently stores bare `model.NodeID`. Widen its entry to a small frame `{NodeID; Rev string}` (`Rev == ""` = working tree). This is a contained change in one leaf package. Pushing focus in snapshot mode records the rev; `b`/`Ctrl-o`/`Ctrl-i` restore it, and the TUI rebuilds the tree whenever the popped frame's rev differs from the current one. Browser back/forward semantics stay intact straight through the mode transition. `Rev` deliberately stays out of `NodeID` (it would perturb cache keys and ripple across the codebase for no benefit — the content hash already separates historical content).
+
+### Known limitations (v0.6, by design)
+
+- **LSP xref disabled in snapshot mode.** gopls/etc. index the working tree, not git history, so `u`/`d` and the callers/callees metadata are suppressed when `m.rev` is a commit — same graceful degrade as a missing language server. Documented, not worked around.
+- No blame view, no arbitrary commit-pair compare, no branch switching, no staging. Out of scope.
+- Commit-list pagination deferred (hard cap for v0.6).
+- Deleted-by-commit files are visible in the History-tab change list and commit explanation but are **not** shown as red tree tombstones in the snapshot (the snapshot tree is `ls-tree` at the commit, which by definition omits them). Deferred.
+- The source pane in snapshot mode shows the **whole file** at the commit with line numbers: unchanged context lines are syntax-highlighted (reusing the normal highlight pipeline on the post-image), added lines tinted green and removed lines tinted red interleaved in place. Added/removed lines are solid-tinted rather than syntax-highlighted (clean background, consistent with the cursor-row rule).
+
+### Phasing within v0.6
+
+1. `internal/gitsrc` + `Revision`/lister abstraction; route `Generator` and `Tree` through it; live mode unchanged (tests assert byte-identical behavior).
+2. History tab + full-branch commit list; highlight → message/stat in source pane.
+3. Commit-level change explanation (LLM + cache).
+4. `Enter` → snapshot mode; `nav.Stack` rev frames; `b`/`Esc` return.
+5. File-level diff coloring + diff view in source pane (highlight reuse).
+6. Per-node change-focused explanations in snapshot mode.
+7. *(stretch — landed)* symbol-level diff coloring: parse the file at the commit and its first parent, match symbols by (receiver, name), color added/modified; best-effort (no coloring on parse/read failure).
 
 ## Open questions / proposed defaults
 

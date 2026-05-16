@@ -11,9 +11,9 @@ func TestStackBackForward(t *testing.T) {
 	a := model.NodeID{Kind: model.KindFile, Path: "a.go"}
 	b := model.NodeID{Kind: model.KindFile, Path: "b.go"}
 	c := model.NodeID{Kind: model.KindFile, Path: "c.go"}
-	s.Push(a)
-	s.Push(b)
-	s.Push(c)
+	s.Push(a, "")
+	s.Push(b, "")
+	s.Push(c, "")
 	got, _ := s.Current()
 	if got != c {
 		t.Fatalf("want c, got %v", got)
@@ -35,7 +35,7 @@ func TestStackBackForward(t *testing.T) {
 	}
 	// Push from middle drops forward history.
 	d := model.NodeID{Kind: model.KindFile, Path: "d.go"}
-	s.Push(d)
+	s.Push(d, "")
 	if _, ok := s.Forward(); ok {
 		t.Fatal("forward should be empty after push")
 	}
@@ -44,9 +44,28 @@ func TestStackBackForward(t *testing.T) {
 func TestStackDedupesConsecutive(t *testing.T) {
 	s := New()
 	a := model.NodeID{Kind: model.KindFile, Path: "a.go"}
-	s.Push(a)
-	s.Push(a)
+	s.Push(a, "")
+	s.Push(a, "")
 	if len(s.Breadcrumbs()) != 1 {
 		t.Fatalf("expected single crumb, got %d", len(s.Breadcrumbs()))
+	}
+}
+
+func TestStackCarriesRevision(t *testing.T) {
+	s := New()
+	a := model.NodeID{Kind: model.KindFile, Path: "a.go"}
+	s.Push(a, "")
+	s.Push(a, "abc123") // same node, different rev → distinct frame
+	if got := s.CurRev(); got != "abc123" {
+		t.Fatalf("CurRev = %q, want abc123", got)
+	}
+	if len(s.Breadcrumbs()) != 2 {
+		t.Fatalf("rev change should add a frame, got %d", len(s.Breadcrumbs()))
+	}
+	if _, ok := s.Back(); !ok {
+		t.Fatal("expected back")
+	}
+	if got := s.CurRev(); got != "" {
+		t.Fatalf("after back CurRev = %q, want live", got)
 	}
 }

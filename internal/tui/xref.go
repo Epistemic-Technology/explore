@@ -128,7 +128,7 @@ func (m *Model) jumpToSymbolRef(ref model.SymbolRef) tea.Cmd {
 		return nil
 	}
 	m.cursor = row
-	m.stack.Push(id)
+	m.stack.Push(id, m.currentRev())
 	cmd := m.focusID(id)
 	if ref.Line > 0 && m.currentFile == ref.Path {
 		m.sourceLine = ref.Line
@@ -333,6 +333,10 @@ type callersResultMsg struct {
 // pre-populated callers), this fires a tea.Cmd so `u` works immediately
 // after `d`-jumping to a fresh symbol, before its explanation has loaded.
 func (m Model) openCallersOf() (tea.Model, tea.Cmd) {
+	if m.atCommitSnapshot() {
+		m.statusMsg = "xref unavailable in a history snapshot (LSP indexes the working tree)"
+		return m, nil
+	}
 	if m.currentID.Kind != model.KindSymbol {
 		m.statusMsg = "callers: focus a symbol first (currently on " + m.currentID.Kind.String() + ")"
 		return m, nil
@@ -391,6 +395,10 @@ type calleesOnLineMsg struct {
 // the result asynchronously via calleesOnLineMsg, so the LSP roundtrip doesn't
 // block the UI.
 func (m Model) openCalleesOnLine() (tea.Model, tea.Cmd) {
+	if m.atCommitSnapshot() {
+		m.statusMsg = "xref unavailable in a history snapshot (LSP indexes the working tree)"
+		return m, nil
+	}
 	if m.activePane != paneSrc {
 		m.statusMsg = "callees: switch to the source pane (3) to pick a line"
 		return m, nil

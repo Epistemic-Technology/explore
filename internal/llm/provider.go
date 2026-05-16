@@ -11,6 +11,7 @@ const (
 	LevelDir    Level = "dir"
 	LevelFile   Level = "file"
 	LevelSymbol Level = "symbol"
+	LevelCommit Level = "commit"
 )
 
 // ExplainRequest carries everything a provider needs to produce a structured
@@ -47,6 +48,15 @@ type ExplainRequest struct {
 	// long-function threshold. BuildExplainUser appends a structural-outline
 	// instruction when this is set; providers themselves don't need to peek.
 	IsLong bool
+
+	// IsDiff marks a change-explanation request (a commit or a node's diff in
+	// snapshot mode). When set, BuildExplainUser emits CommitMessage + Diff and
+	// asks the model to explain what changed and why, instead of the standard
+	// "explain this code" framing. Same JSON schema as every other level, so
+	// providers need no special handling.
+	IsDiff        bool
+	CommitMessage string
+	Diff          string
 }
 
 type Explanation struct {

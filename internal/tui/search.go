@@ -126,7 +126,7 @@ func (m *Model) jumpToSearchResult(id model.NodeID) tea.Cmd {
 	}
 	m.cursor = row
 	m.activePane = paneTree
-	m.stack.Push(id)
+	m.stack.Push(id, m.currentRev())
 	return m.focusID(id)
 }
 

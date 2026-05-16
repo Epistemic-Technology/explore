@@ -18,6 +18,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/mikethicke/explore/internal/debug"
+	"github.com/mikethicke/explore/internal/gitsrc"
 	"github.com/mikethicke/explore/internal/highlight"
 	"github.com/mikethicke/explore/internal/index"
 	"github.com/mikethicke/explore/internal/llm"
@@ -49,7 +50,7 @@ const (
 )
 
 var paneTabs = map[int][]string{
-	paneTree: {"Tree"},
+	paneTree: {"Tree", "History"},
 	paneExp:  {"Explanation", "Q&A (node)", "Q&A (session)"},
 	paneSrc:  {"Source"},
 }
@@ -72,6 +73,52 @@ type Model struct {
 	tree       *Tree
 	stack      *nav.Stack
 	prefetcher *index.Prefetcher
+
+	// baseGen is the live working-tree generator. gen points at it normally
+	// and is swapped for a revision-scoped copy while in a snapshot;
+	// exitSnapshot restores it.
+	baseGen *index.Generator
+
+	// repo is nil when the root is not a git repository (or git is missing);
+	// History/snapshot features degrade off, mirroring missing-LSP.
+	repo *gitsrc.Repo
+
+	// rev is the logical revision driving diff mode: "" = live (no diff
+	// overlay), workingRef = working-tree-vs-HEAD diff, else a commit sha
+	// (historical snapshot). The tree/generator are pointed accordingly by
+	// applyRevision; this field is the source of truth (currentRev).
+	rev string
+
+	// snapshotDesc is "<shortsha> <subject>" while browsing a historical
+	// snapshot, "" when on the live working tree. Drives the status banner.
+	snapshotDesc string
+
+	// Diff overlay state for snapshot mode. snapshotChanges maps a
+	// repo-relative path to its name-status vs. the commit's first parent
+	// (A/M/D/R…); it drives tree coloring. snapshotDiff caches per-file
+	// unified patches for the source pane. All keyed within the active
+	// snapshot commit and reset by applyRevision.
+	snapshotChanges map[string]string
+	snapshotDiff    map[string]string
+	snapshotDiffErr map[string]error
+	loadingDiff     map[string]bool
+
+	// Per-node change-focused explanations for changed files in the active
+	// snapshot, keyed by path. Unchanged nodes use the normal expCache path.
+	snapshotNodeExp    map[string]*model.Explanation
+	snapshotNodeExpErr map[string]error
+	loadingNodeExp     map[string]bool
+
+	// Symbol-level change status per changed file (path → symbol name →
+	// "A"/"M"), best-effort: built by parsing the file at the commit and its
+	// first parent. Drives symbol-row coloring; absent on parse failure.
+	snapshotSymChanges map[string]map[string]string
+	loadingSym         map[string]bool
+
+	// treeTab selects the tree pane's tab (Tree / History). history holds the
+	// commit list + per-commit detail cache for the History tab.
+	treeTab int
+	history historyUI
 
 	width, height int
 
@@ -226,7 +273,7 @@ func (q *qaState) streamVisible(mode string, id model.NodeID) bool {
 	return true
 }
 
-func NewModel(gen *index.Generator, tree *Tree, prefetcher *index.Prefetcher, tokenBudget int) Model {
+func NewModel(gen *index.Generator, tree *Tree, prefetcher *index.Prefetcher, tokenBudget int, repo *gitsrc.Repo) Model {
 	hl, err := highlight.New()
 	if err != nil {
 		// A query compile error here is a programmer bug, but we don't want
@@ -252,6 +299,7 @@ func NewModel(gen *index.Generator, tree *Tree, prefetcher *index.Prefetcher, to
 	}
 	m := Model{
 		gen:         gen,
+		baseGen:     gen,
 		tree:        tree,
 		prefetcher:  prefetcher,
 		stack:       nav.New(),
@@ -266,11 +314,13 @@ func NewModel(gen *index.Generator, tree *Tree, prefetcher *index.Prefetcher, to
 		secretsCh:   secretsCh,
 		tokenBudget: tokenBudget,
 		highlighter: hl,
+		repo:        repo,
+		history:     newHistoryUI(),
 	}
 	if rows := tree.Rows(); len(rows) > 0 {
 		m.cursor = 0
 		m.currentID = rows[0].ID
-		m.stack.Push(m.currentID)
+		m.stack.Push(m.currentID, "")
 		// Kick off the first explanation + warm the neighborhood. The Cmd
 		// returned by scheduleLoad must be threaded through Init() so the
 		// debouncedLoadMsg actually fires.
@@ -444,11 +494,11 @@ func (m *Model) syncCurrent() tea.Cmd {
 		return nil
 	}
 	m.currentID = newID
-	m.stack.Push(newID)
+	m.stack.Push(newID, m.currentRev())
 	m.loadErr = nil
 	cmd := m.scheduleLoad(newID)
 	m.enqueuePrefetch(newID)
-	return cmd
+	return tea.Batch(cmd, m.maybeLoadFileDiff())
 }
 
 // enqueuePrefetch asks the prefetcher to warm explanations for nodes the user
@@ -458,6 +508,13 @@ func (m *Model) syncCurrent() tea.Cmd {
 // itself, so we can call this freely on every focus change.
 func (m *Model) enqueuePrefetch(currentID model.NodeID) {
 	if m.prefetcher == nil {
+		return
+	}
+	// The prefetcher reads the live working tree; warming it during a
+	// historical snapshot would stuff HEAD-era explanations into expCache
+	// under historical NodeIDs. Working-diff mode IS the working tree, so
+	// prefetch stays valid there.
+	if m.atCommitSnapshot() {
 		return
 	}
 	const window = 5
@@ -768,6 +825,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.loadCmd(ctx, msg.id, msg.gen, msg.regen)
 
 	case prefetchUpdateMsg:
+		// Prefetch results come from the live working-tree generator; ignore
+		// them while a historical snapshot is active so historical NodeIDs
+		// aren't filled with HEAD-era explanations. Keep the listener armed.
+		if m.atCommitSnapshot() {
+			if m.prefetcher == nil {
+				return m, nil
+			}
+			return m, listenPrefetch(m.prefetcher.Updates())
+		}
 		if msg.update.Err == nil && msg.update.Exp != nil {
 			m.expCache[msg.update.ID] = msg.update.Exp
 			debug.Logf("prefetchUpdateMsg: cached kind=%v path=%q sym=%q", msg.update.ID.Kind, msg.update.ID.Path, msg.update.ID.Symbol)
@@ -834,6 +900,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg = "editor: " + msg.err.Error()
 		}
 		return m, nil
+
+	case gitLogMsg:
+		return m.handleGitLogMsg(msg)
+
+	case commitDetailMsg:
+		return m.handleCommitDetailMsg(msg)
+
+	case commitExplainMsg:
+		return m.handleCommitExplainMsg(msg)
+
+	case commitChangesMsg:
+		return m.handleCommitChangesMsg(msg)
+
+	case fileDiffMsg:
+		return m.handleFileDiffMsg(msg)
+
+	case nodeChangeExplainMsg:
+		return m.handleNodeChangeExplainMsg(msg)
+
+	case symChangesMsg:
+		return m.handleSymChangesMsg(msg)
 
 	case callersResultMsg:
 		return m.handleCallersResultMsg(msg)
@@ -945,21 +1032,21 @@ func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "]":
 		m.cycleTab(1)
 		m.resetVim()
-		return m, nil
+		return m, m.ensureHistoryLoaded()
 	case "[":
 		m.cycleTab(-1)
 		m.resetVim()
-		return m, nil
+		return m, m.ensureHistoryLoaded()
 	case "o", "b", "ctrl+o":
 		m.resetVim()
 		if id, ok := m.stack.Back(); ok {
-			return m, m.focusID(id)
+			return m, m.focusStackTarget(id)
 		}
 		return m, nil
 	case "ctrl+i":
 		m.resetVim()
 		if id, ok := m.stack.Forward(); ok {
-			return m, m.focusID(id)
+			return m, m.focusStackTarget(id)
 		}
 		return m, nil
 	case "?":
@@ -977,6 +1064,9 @@ func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "e":
 		m.resetVim()
 		return m.openEditor()
+	case "H":
+		m.resetVim()
+		return m, m.openHistory()
 	case "u":
 		m.resetVim()
 		return m.openCallersOf()
@@ -1005,6 +1095,13 @@ func (m Model) updateNav(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		// Any other key cancels the pending yank — vim convention.
 		m.statusMsg = ""
+	}
+
+	// In a historical snapshot, Esc returns to the live working tree (unless a
+	// source selection is in progress, where Esc still cancels the selection).
+	if s == "esc" && m.inSnapshot() && !m.selecting {
+		m.resetVim()
+		return m.exitSnapshot()
 	}
 
 	// Re-enter Q&A input mode from the inactive state. This branch only runs
@@ -1257,6 +1354,8 @@ func (m *Model) cycleTab(delta int) {
 	switch m.activePane {
 	case paneExp:
 		m.expTab = (m.expTab + delta + len(tabs)) % len(tabs)
+	case paneTree:
+		m.treeTab = (m.treeTab + delta + len(tabs)) % len(tabs)
 	}
 }
 
@@ -1272,6 +1371,9 @@ func (m *Model) enterExpPane() {
 }
 
 func (m Model) updateTreePane(s string) (tea.Model, tea.Cmd) {
+	if m.treeTab == treeTabHistory {
+		return m.updateHistoryPane(s)
+	}
 	rows := m.tree.Rows()
 	switch s {
 	case "j", "down":
@@ -1338,7 +1440,53 @@ func (m Model) updateTreePane(s string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateSourcePane dispatches source-pane keys: a unified-diff view in
+// snapshot mode (scroll-only), otherwise the normal file source pane.
 func (m Model) updateSourcePane(s string) (tea.Model, tea.Cmd) {
+	if m.inDiffView() {
+		return m.updateDiffScroll(s)
+	}
+	return m.updateSourcePaneFile(s)
+}
+
+// updateDiffScroll scrolls the unified-diff view (snapshot mode). The diff has
+// no per-line cursor, so j/k/J/K/g/G just move m.srcScroll within the patch.
+func (m Model) updateDiffScroll(s string) (tea.Model, tea.Cmd) {
+	n := 0
+	if d, ok := m.snapshotDiff[m.currentFile]; ok {
+		n = len(parseInlineDiff(d)) // display rows, matching renderDiffView
+	}
+	page := m.sourceViewportH()
+	switch s {
+	case "j", "down":
+		m.pendingG = false
+		m.srcScroll = clamp(m.srcScroll+m.takeCount(1), 0, max(0, n-1))
+	case "k", "up":
+		m.pendingG = false
+		m.srcScroll = clamp(m.srcScroll-m.takeCount(1), 0, max(0, n-1))
+	case "J", "ctrl+d", "pgdown":
+		m.pendingG = false
+		m.srcScroll = clamp(m.srcScroll+page*m.takeCount(1), 0, max(0, n-1))
+	case "K", "ctrl+u", "pgup":
+		m.pendingG = false
+		m.srcScroll = clamp(m.srcScroll-page*m.takeCount(1), 0, max(0, n-1))
+	case "g":
+		if m.pendingG {
+			m.pendingG = false
+			m.srcScroll = 0
+		} else {
+			m.pendingG = true
+		}
+	case "G":
+		m.resetVim()
+		m.srcScroll = max(0, n-1)
+	default:
+		m.resetVim()
+	}
+	return m, nil
+}
+
+func (m Model) updateSourcePaneFile(s string) (tea.Model, tea.Cmd) {
 	switch s {
 	case "j", "down":
 		m.pendingG = false
@@ -1535,7 +1683,7 @@ func (m *Model) focusID(id model.NodeID) tea.Cmd {
 	if r := m.tree.FindRow(id); r >= 0 {
 		m.cursor = r
 	}
-	return m.scheduleLoad(id)
+	return tea.Batch(m.scheduleLoad(id), m.maybeLoadFileDiff())
 }
 
 // --- Q&A ---
@@ -1757,7 +1905,7 @@ func (m Model) View() string {
 	}
 	expH, srcH := m.paneHeights()
 
-	treeBox := m.boxPane(paneTree, 0, m.renderTree(treeW-2, contentH-2), treeW, contentH)
+	treeBox := m.boxPane(paneTree, m.treeTab, m.renderTree(treeW-2, contentH-2), treeW, contentH)
 	expBox := m.boxPane(paneExp, m.expTab, m.renderExp(centerW-2, expH-2), centerW, expH)
 	srcBox := m.boxPane(paneSrc, 0, m.renderSource(centerW-2, srcH-2), centerW, srcH)
 	center := lipgloss.JoinVertical(lipgloss.Left, expBox, srcBox)
@@ -1837,6 +1985,9 @@ func (m Model) renderTabStrip(num, activeTab int) string {
 }
 
 func (m Model) renderTree(w, h int) string {
+	if m.treeTab == treeTabHistory {
+		return m.renderHistory(w, h)
+	}
 	rows := m.tree.Rows()
 	if h < 1 || len(rows) == 0 {
 		return ""
@@ -1855,8 +2006,15 @@ func (m Model) renderTree(w, h int) string {
 			}
 		}
 		line := truncate(indent+marker+r.Label, w)
-		if i == m.cursor {
+		switch {
+		case i == m.cursor:
+			// Cursor highlight wins; like syntax highlighting, diff color is
+			// dropped on the cursor row so the background paints cleanly.
 			line = selectedStyle.Render(line)
+		case m.inSnapshot():
+			if st, ok := m.treeRowStyle(r.ID); ok {
+				line = st.Render(line)
+			}
 		}
 		b.WriteString(line + "\n")
 	}
@@ -1866,6 +2024,12 @@ func (m Model) renderTree(w, h int) string {
 func (m Model) renderExp(w, h int) string {
 	if mode := qaTabMode(m.expTab); mode != "" {
 		return m.renderQA(mode, w, h)
+	}
+	if m.treeTab == treeTabHistory {
+		return m.renderCommitExplain(w, h)
+	}
+	if m.inSnapshot() && m.currentFile != "" && m.changeStatus(m.currentFile) != "" {
+		return m.renderNodeChangeExplain(w, h)
 	}
 	crumbs := m.stack.Breadcrumbs()
 	var head strings.Builder
@@ -1908,6 +2072,12 @@ func (m Model) renderExp(w, h int) string {
 }
 
 func (m Model) renderSource(w, h int) string {
+	if m.treeTab == treeTabHistory {
+		return m.renderCommitDetail(w, h)
+	}
+	if m.inDiffView() {
+		return m.renderDiffView(w, h)
+	}
 	if m.currentFile == "" {
 		return dimStyle.Render("(no file focused — pick one in [1] Tree)")
 	}
@@ -2154,7 +2324,15 @@ func (m Model) renderStatus() string {
 	} else if m.pendingY {
 		keys = "(y) " + keys
 	}
-	return keys + "  " + m.renderUsage() + m.statusMsg
+	line := keys + "  " + m.renderUsage() + m.statusMsg
+	if m.isWorkingDiff() {
+		return warnStyle.Render(" ⌥ WORKING (uncommitted vs HEAD) ") + "  " + line
+	}
+	if m.inSnapshot() {
+		badge := warnStyle.Render(" ⌥ snapshot " + truncate(m.snapshotDesc, 40) + " ")
+		return badge + "  " + line
+	}
+	return line
 }
 
 // statusHints returns the context-appropriate slice of shortcut prompts for

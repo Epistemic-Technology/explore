@@ -9,7 +9,7 @@ import (
 
 const (
 	helpOverlayW = 76
-	helpOverlayH = 28
+	helpOverlayH = 34
 )
 
 // helpEntry is one row of the cheat sheet.
@@ -77,6 +77,15 @@ var helpSections = []helpSection{
 			{"u", "show callers of the focused symbol"},
 			{"d", "show callees on the current source line"},
 			{"y", "yank menu  (p path · e explanation · s source)"},
+		},
+	},
+	{
+		title: "Git history",
+		entries: []helpEntry{
+			{"H", "open the History tab ([ ] also cycles to it)"},
+			{"j / k", "move between commits (WORKING = uncommitted, at top)"},
+			{"Enter", "enter that commit / WORKING as a diff snapshot"},
+			{"Esc  or  b", "leave the snapshot, back to the working tree"},
 		},
 	},
 	{

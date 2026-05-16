@@ -36,6 +36,19 @@ func BuildExplainUser(req ExplainRequest) string {
 	if req.Symbol != "" {
 		fmt.Fprintf(&b, "Symbol: %s\n", req.Symbol)
 	}
+	if req.IsDiff {
+		if req.CommitMessage != "" {
+			fmt.Fprintf(&b, "\nCommit message:\n%s\n", strings.TrimSpace(req.CommitMessage))
+		}
+		b.WriteString("\nDiff (unified, vs. first parent):\n```diff\n")
+		b.WriteString(req.Diff)
+		b.WriteString("\n```\n")
+		b.WriteString("\nExplain what this change does and why, grounded in the diff and commit message. " +
+			"In `prose`: lead with the change's intent, then the mechanism (which identifiers/files changed and how), then any risk or follow-up. " +
+			"Use `key_types` for the most affected symbols/files and `gotchas` for behavioral or compatibility risks introduced. " +
+			"Return only the JSON object described in the system prompt.")
+		return b.String()
+	}
 	if req.Signature != "" {
 		fmt.Fprintf(&b, "Signature: %s\n", req.Signature)
 	}

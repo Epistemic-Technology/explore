@@ -3,7 +3,6 @@ package index
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/mikethicke/explore/internal/cache"
 	"github.com/mikethicke/explore/internal/debug"
+	"github.com/mikethicke/explore/internal/gitsrc"
 	"github.com/mikethicke/explore/internal/llm"
 	"github.com/mikethicke/explore/internal/model"
 	"github.com/mikethicke/explore/internal/tsparse"
@@ -118,25 +118,24 @@ func (g *Generator) ExplainRepo(ctx context.Context) (*model.Explanation, error)
 // the LLM sees: an enumerated list of file/dir summaries. For the repo root
 // (isRepo=true) it also prepends a language-stats line walking the whole tree.
 func (g *Generator) buildDirView(ctx context.Context, relPath string, isRepo bool) (string, error) {
-	abs := filepath.Join(g.Root, relPath)
-	entries, err := os.ReadDir(abs)
+	entries, err := g.Rev.ReadDir(relPath)
 	if err != nil {
 		return "", err
 	}
 
-	var subdirs, files []os.DirEntry
+	var subdirs, files []gitsrc.DirEntry
 	for _, e := range entries {
-		if dirSkipEntry(e.Name()) {
+		if dirSkipEntry(e.Name) {
 			continue
 		}
-		if e.IsDir() {
+		if e.IsDir {
 			subdirs = append(subdirs, e)
-		} else if !dirSkipFile(e.Name()) {
+		} else if !dirSkipFile(e.Name) {
 			files = append(files, e)
 		}
 	}
-	sort.Slice(subdirs, func(i, j int) bool { return subdirs[i].Name() < subdirs[j].Name() })
-	sort.Slice(files, func(i, j int) bool { return files[i].Name() < files[j].Name() })
+	sort.Slice(subdirs, func(i, j int) bool { return subdirs[i].Name < subdirs[j].Name })
+	sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
 
 	var b strings.Builder
 	if isRepo {
@@ -156,16 +155,16 @@ func (g *Generator) buildDirView(ctx context.Context, relPath string, isRepo boo
 		if listed >= maxChildrenListed {
 			break
 		}
-		childPath := filepath.Join(relPath, d.Name())
-		fmt.Fprintf(&b, "  - %s/ — %s\n", d.Name(), g.subdirBlurb(childPath))
+		childPath := filepath.Join(relPath, d.Name)
+		fmt.Fprintf(&b, "  - %s/ — %s\n", d.Name, g.subdirBlurb(childPath))
 		listed++
 	}
 	for _, f := range files {
 		if listed >= maxChildrenListed {
 			break
 		}
-		childPath := filepath.Join(relPath, f.Name())
-		fmt.Fprintf(&b, "  - %s — %s\n", f.Name(), g.fileBlurb(ctx, childPath))
+		childPath := filepath.Join(relPath, f.Name)
+		fmt.Fprintf(&b, "  - %s — %s\n", f.Name, g.fileBlurb(ctx, childPath))
 		listed++
 	}
 	if listed < total {
@@ -179,7 +178,7 @@ func (g *Generator) buildDirView(ctx context.Context, relPath string, isRepo boo
 // symbol-count blurb. Reads the file once either way.
 func (g *Generator) fileBlurb(ctx context.Context, relPath string) string {
 	abs := filepath.Join(g.Root, relPath)
-	src, err := os.ReadFile(abs)
+	src, err := g.Rev.ReadFile(relPath)
 	if err != nil {
 		return "(unreadable)"
 	}
@@ -204,19 +203,18 @@ func (g *Generator) fileBlurb(ctx context.Context, relPath string) string {
 // explanations over time, which will be picked up via cache hits on the
 // dir-level view hash on subsequent generation.
 func (g *Generator) subdirBlurb(relPath string) string {
-	abs := filepath.Join(g.Root, relPath)
-	entries, err := os.ReadDir(abs)
+	entries, err := g.Rev.ReadDir(relPath)
 	if err != nil {
 		return "(unreadable)"
 	}
 	var sub, fls int
 	for _, e := range entries {
-		if dirSkipEntry(e.Name()) {
+		if dirSkipEntry(e.Name) {
 			continue
 		}
-		if e.IsDir() {
+		if e.IsDir {
 			sub++
-		} else if !dirSkipFile(e.Name()) {
+		} else if !dirSkipFile(e.Name) {
 			fls++
 		}
 	}
@@ -246,26 +244,26 @@ func (g *Generator) langStats() string {
 		if depth > maxDepth || scanned >= maxFiles {
 			return
 		}
-		entries, err := os.ReadDir(filepath.Join(g.Root, rel))
+		entries, err := g.Rev.ReadDir(rel)
 		if err != nil {
 			return
 		}
 		for _, e := range entries {
-			if dirSkipEntry(e.Name()) {
+			if dirSkipEntry(e.Name) {
 				continue
 			}
-			if e.IsDir() {
-				walk(filepath.Join(rel, e.Name()), depth+1)
+			if e.IsDir {
+				walk(filepath.Join(rel, e.Name), depth+1)
 				continue
 			}
-			if dirSkipFile(e.Name()) {
+			if dirSkipFile(e.Name) {
 				continue
 			}
 			scanned++
 			if scanned >= maxFiles {
 				return
 			}
-			lang := langForExt(filepath.Ext(e.Name()))
+			lang := langForExt(filepath.Ext(e.Name))
 			if lang == "" {
 				continue
 			}

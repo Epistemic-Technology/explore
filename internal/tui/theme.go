@@ -38,3 +38,32 @@ var syntaxStyles = map[highlight.Capture]lipgloss.Style{
 func styleFor(c highlight.Capture) lipgloss.Style {
 	return syntaxStyles[c]
 }
+
+// Git diff / change styles. Foreground colors for the colored tree and
+// changed-file lists (green=added, yellow=modified, red=deleted); the *Bg
+// styles tint whole diff lines in the source pane.
+var (
+	addStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
+	modifyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("180"))
+	deleteStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("167"))
+
+	diffAddBg  = lipgloss.NewStyle().Foreground(lipgloss.Color("151")).Background(lipgloss.Color("22"))
+	diffDelBg  = lipgloss.NewStyle().Foreground(lipgloss.Color("210")).Background(lipgloss.Color("52"))
+	diffHunkBg = lipgloss.NewStyle().Foreground(lipgloss.Color("117")).Background(lipgloss.Color("236"))
+)
+
+// statusStyle maps a git name-status code (A/M/D/R/C, optionally with a
+// similarity score like R100) to its tree/list color.
+func statusStyle(status string) lipgloss.Style {
+	if status == "" {
+		return lipgloss.NewStyle()
+	}
+	switch status[0] {
+	case 'A':
+		return addStyle
+	case 'D':
+		return deleteStyle
+	default: // M, R, C, T, …
+		return modifyStyle
+	}
+}
